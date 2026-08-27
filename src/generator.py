@@ -18,7 +18,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
 DROPBOX_FOLDER_PATH = os.getenv("DROPBOX_FOLDER_PATH", "/")
 BATCH_SIZE = 10000
-NUM_WORKERS = 5   # set to cpu_count() or any number
+NUM_WORKERS = 10   # set to cpu_count() or any number
 PROGRESS_COLUMN = "generation_progress"
 
 # Global stop event (will be shared via Manager)
