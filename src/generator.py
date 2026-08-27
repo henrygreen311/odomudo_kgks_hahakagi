@@ -5,6 +5,7 @@ import os
 import sys
 import math
 import signal
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import dropbox
 from mnemonic import Mnemonic
@@ -18,10 +19,10 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
 DROPBOX_FOLDER_PATH = os.getenv("DROPBOX_FOLDER_PATH", "/")
 BATCH_SIZE = 10000
-NUM_WORKERS = 10   # set to cpu_count() or any number
+NUM_WORKERS = 10   # adjust as needed
 PROGRESS_COLUMN = "generation_progress"
 
-# Global stop event (will be shared via Manager)
+# Global stop event (shared via Manager)
 stop_event = None
 
 # ----------------------------------------------------------------------
@@ -60,7 +61,7 @@ def update_progress(increment):
 # ----------------------------------------------------------------------
 # Worker function (runs in a separate process)
 # ----------------------------------------------------------------------
-def worker(start_idx, count, worker_id, stop_event):
+def worker(start_idx, count, worker_id, run_id, stop_event):
     dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
     folder_path = DROPBOX_FOLDER_PATH.rstrip('/')
 
@@ -80,7 +81,6 @@ def worker(start_idx, count, worker_id, stop_event):
     i = 0
 
     for i in range(count):
-        # Check stop signal
         if stop_event.is_set():
             print(f"Worker {worker_id} received stop signal, finishing...")
             break
@@ -103,7 +103,7 @@ def worker(start_idx, count, worker_id, stop_event):
         # Upload if chunk full
         if len(chunk) >= BATCH_SIZE:
             file_counter += 1
-            filename = f"worker{worker_id}_seeds_{file_counter:08d}_{len(chunk)}.txt"
+            filename = f"seeds_{run_id}_w{worker_id}_{file_counter:08d}_{len(chunk)}.txt"
             content = "\n".join(chunk)
             path = f"{folder_path}/{filename}"
             try:
@@ -120,21 +120,16 @@ def worker(start_idx, count, worker_id, stop_event):
             update_progress(10000)
             processed += 10000
 
-    # Save remaining progress (if any) for the iterations actually processed
-    # i is the last index processed (0‑based). If we broke early, i might be less than count-1.
-    # We need to know how many we processed in total.
-    # We'll keep a counter `processed` for progress already saved; we'll update the rest.
-    # Actually, we'll compute the total processed count = i + 1 (if loop ran at least once)
-    # But careful if we never entered the loop (count=0).
+    # Save remaining progress
     total_processed = i + 1 if i > 0 else 0
     remaining_progress = total_processed - processed
     if remaining_progress > 0:
         update_progress(remaining_progress)
 
-    # Upload any leftover chunk
+    # Upload leftover chunk
     if chunk:
         file_counter += 1
-        filename = f"worker{worker_id}_seeds_{file_counter:08d}_{len(chunk)}.txt"
+        filename = f"seeds_{run_id}_w{worker_id}_{file_counter:08d}_{len(chunk)}.txt"
         content = "\n".join(chunk)
         path = f"{folder_path}/{filename}"
         try:
@@ -176,6 +171,9 @@ def main():
     remaining = total_perms - progress
     print(f"Total permutations: {total_perms:,}, already processed: {progress:,}, remaining: {remaining:,}")
 
+    # Generate a unique run ID (timestamp)
+    run_id = str(int(time.time()))
+
     # Split work
     chunk_size = remaining // NUM_WORKERS
     remainder = remaining % NUM_WORKERS
@@ -188,39 +186,31 @@ def main():
         tasks.append((start, count, w + 1))
         start += count
 
-    # Create a Manager and a shared Event
     import multiprocessing as mp
     manager = mp.Manager()
     stop_event = manager.Event()
 
-    # Set up signal handler to set stop_event on Ctrl+C
     def signal_handler(sig, frame):
         print("\nInterrupt received! Setting stop event...")
         stop_event.set()
 
     signal.signal(signal.SIGINT, signal_handler)
 
-    # Use ProcessPoolExecutor
     with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
-        # Submit all tasks
-        futures = [executor.submit(worker, start, count, wid, stop_event)
+        futures = [executor.submit(worker, start, count, wid, run_id, stop_event)
                    for (start, count, wid) in tasks]
 
         try:
-            # Wait for all futures to complete, but allow KeyboardInterrupt
             for future in as_completed(futures):
-                # This will raise any exception from the worker
                 future.result()
         except KeyboardInterrupt:
             print("Main process interrupted, waiting for workers to finish...")
-            # The stop_event is already set; workers will exit on their own.
-            # We just wait for them to finish.
             for future in futures:
                 try:
-                    future.result(timeout=10)  # give them some time
+                    future.result(timeout=10)
                 except Exception:
                     pass
-        # After all workers finish (or interrupted), show final progress
+
         final_progress = get_progress()
         print(f"Final progress: {final_progress:,} / {total_perms:,}")
 
