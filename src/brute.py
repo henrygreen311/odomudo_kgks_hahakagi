@@ -33,7 +33,7 @@ ETH_RESPONSE_FILE = "ETH_scan_response.json"
 TRON_RESPONSE_FILE = "TRON_scan_response.json"
 
 MAX_CONCURRENT = 100
-BATCH_WRITE_INTERVAL = 1000
+BATCH_WRITE_INTERVAL = 100
 
 # ------------------ SILENT LOGGING ------------------
 class NullHandler(logging.Handler):
@@ -244,7 +244,7 @@ async def scan_seed(seed, eth_key, tron_key, session, writer, eth_sem, tron_sem)
 
         global scanned_counter
         scanned_counter += 1
-        if scanned_counter % 100 == 0:
+        if scanned_counter % 1000 == 0:
             print(f"Scanned {scanned_counter} seeds so far...")
 
 # ------------------ PROCESS ONE BATCH FILE ------------------
