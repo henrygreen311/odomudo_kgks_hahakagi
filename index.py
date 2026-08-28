@@ -36,12 +36,11 @@ def fetch_dropbox_credentials(supabase):
         raise RuntimeError("No credentials found in 'brute' table.")
     row = response.data[0]
     token = row.get("dropbox_access_token")
-    folder_path = row.get("dropbox_folder_path")
-    if not token:
-        raise ValueError("dropbox_access_token column is empty.")
-    if not folder_path:
-        folder_path = "/"
-    return token, folder_path
+    folder_path = row.get("dropbox_folder_path", "/")
+    app_key = row.get("dropbox_app_key")
+    app_secret = row.get("dropbox_app_secret")
+    refresh_token = row.get("dropbox_refresh_token")
+    return token, folder_path, app_key, app_secret, refresh_token
 
 def main():
     parser = argparse.ArgumentParser()
@@ -53,22 +52,28 @@ def main():
         print("Please specify --generate or --scan")
         sys.exit(1)
 
-    # Load db.txt and set all env vars needed by generator.py
     config = load_db_config()
     os.environ["SUPABASE_URL"] = config["SUPABASE_URL"]
     os.environ["SUPABASE_KEY"] = config["SUPABASE_KEY"]
 
-    # Get Dropbox credentials from the brute table
     supabase = create_supabase_client()
-    token, folder_path = fetch_dropbox_credentials(supabase)
-    os.environ["DROPBOX_ACCESS_TOKEN"] = token
+    token, folder_path, app_key, app_secret, refresh_token = fetch_dropbox_credentials(supabase)
+
+    if token:
+        os.environ["DROPBOX_ACCESS_TOKEN"] = token
+    if app_key:
+        os.environ["DROPBOX_APP_KEY"] = app_key
+    if app_secret:
+        os.environ["DROPBOX_APP_SECRET"] = app_secret
+    if refresh_token:
+        os.environ["DROPBOX_REFRESH_TOKEN"] = refresh_token
     os.environ["DROPBOX_FOLDER_PATH"] = folder_path
 
     if args.generate:
-        # Run src.generator as a module
         subprocess.run(["python3", "-m", "src.generator"], check=True)
     elif args.scan:
-        subprocess.run(["python3", "brute.py", "--scan"], check=True)
+        print("Starting Dropbox scanner (src.brute)...")
+        subprocess.run(["python3", "-m", "src.brute"], check=True)
 
 if __name__ == "__main__":
     main()
