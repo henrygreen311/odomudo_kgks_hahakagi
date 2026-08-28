@@ -18,11 +18,13 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
 DROPBOX_FOLDER_PATH = os.getenv("DROPBOX_FOLDER_PATH", "/")
+DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY")
+DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET")
+DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
 BATCH_SIZE = 10000
-NUM_WORKERS = 10   # adjust as needed
+NUM_WORKERS = 10
 PROGRESS_COLUMN = "generation_progress"
 
-# Global stop event (shared via Manager)
 stop_event = None
 
 # ----------------------------------------------------------------------
@@ -44,7 +46,6 @@ def get_progress():
     return res.data[0].get(PROGRESS_COLUMN, 0) if res.data else 0
 
 def update_progress(increment):
-    """Atomically increment progress with fallback."""
     supabase = get_supabase()
     row_id = get_row_id()
     try:
@@ -59,10 +60,33 @@ def update_progress(increment):
             print(f"Progress update failed: {e}")
 
 # ----------------------------------------------------------------------
-# Worker function (runs in a separate process)
+# Dropbox client factory (auto‑refresh via refresh token)
+# ----------------------------------------------------------------------
+def get_dropbox_client():
+    """Return a Dropbox client that auto‑refreshes if refresh credentials exist."""
+    if DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET:
+        try:
+            return dropbox.Dropbox(
+                oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
+                app_key=DROPBOX_APP_KEY,
+                app_secret=DROPBOX_APP_SECRET,
+            )
+        except Exception as e:
+            print(f"Failed to create Dropbox client with refresh token: {e}")
+            sys.exit(1)
+    elif DROPBOX_ACCESS_TOKEN:
+        print("WARNING: Using short‑lived access token; it may expire.")
+        return dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
+    else:
+        print("ERROR: No Dropbox credentials found.")
+        sys.exit(1)
+
+# ----------------------------------------------------------------------
+# Worker function
 # ----------------------------------------------------------------------
 def worker(start_idx, count, worker_id, run_id, stop_event):
-    dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
+    # Each worker gets its own client (auto‑refresh capable)
+    dbx = get_dropbox_client()
     folder_path = DROPBOX_FOLDER_PATH.rstrip('/')
 
     try:
@@ -86,7 +110,6 @@ def worker(start_idx, count, worker_id, run_id, stop_event):
             break
 
         current_idx = start_idx + i
-        # Compute permutation inline
         arr = words[:]
         k = current_idx
         perm = []
@@ -100,7 +123,6 @@ def worker(start_idx, count, worker_id, run_id, stop_event):
         if mnemo.check(mnemonic):
             chunk.append(mnemonic)
 
-        # Upload if chunk full
         if len(chunk) >= BATCH_SIZE:
             file_counter += 1
             filename = f"seeds_{run_id}_w{worker_id}_{file_counter:08d}_{len(chunk)}.txt"
@@ -115,18 +137,15 @@ def worker(start_idx, count, worker_id, run_id, stop_event):
                 print(f"Worker {worker_id} upload error: {e}")
             chunk = []
 
-        # Update progress every 10k iterations
         if (i + 1) % 10000 == 0:
             update_progress(10000)
             processed += 10000
 
-    # Save remaining progress
     total_processed = i + 1 if i > 0 else 0
     remaining_progress = total_processed - processed
     if remaining_progress > 0:
         update_progress(remaining_progress)
 
-    # Upload leftover chunk
     if chunk:
         file_counter += 1
         filename = f"seeds_{run_id}_w{worker_id}_{file_counter:08d}_{len(chunk)}.txt"
@@ -143,13 +162,16 @@ def worker(start_idx, count, worker_id, run_id, stop_event):
     print(f"Worker {worker_id} finished. Processed {total_processed} indices. Stopped early: {stop_event.is_set()}")
 
 # ----------------------------------------------------------------------
-# Main entry point
+# Main
 # ----------------------------------------------------------------------
 def main():
     global stop_event
 
-    if not all([SUPABASE_URL, SUPABASE_KEY, DROPBOX_ACCESS_TOKEN]):
-        print("ERROR: Missing required environment variables.")
+    if not all([SUPABASE_URL, SUPABASE_KEY]):
+        print("ERROR: Supabase credentials missing.")
+        sys.exit(1)
+    if not (DROPBOX_ACCESS_TOKEN or (DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET)):
+        print("ERROR: Missing Dropbox credentials (access token or refresh token + app credentials).")
         sys.exit(1)
 
     try:
@@ -171,10 +193,8 @@ def main():
     remaining = total_perms - progress
     print(f"Total permutations: {total_perms:,}, already processed: {progress:,}, remaining: {remaining:,}")
 
-    # Generate a unique run ID (timestamp)
     run_id = str(int(time.time()))
 
-    # Split work
     chunk_size = remaining // NUM_WORKERS
     remainder = remaining % NUM_WORKERS
     tasks = []
