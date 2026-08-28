@@ -32,8 +32,8 @@ TRON_API_FILE = "TRON_api.txt"
 ETH_RESPONSE_FILE = "ETH_scan_response.json"
 TRON_RESPONSE_FILE = "TRON_scan_response.json"
 
-MAX_CONCURRENT = 500
-BATCH_WRITE_INTERVAL = 100
+MAX_CONCURRENT = 100
+BATCH_WRITE_INTERVAL = 1000
 
 # ------------------ SILENT LOGGING ------------------
 class NullHandler(logging.Handler):
