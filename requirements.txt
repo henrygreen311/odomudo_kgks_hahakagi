@@ -1,3 +1,4 @@
 supabase
 dropbox
 mnemonic
+aiohttp
