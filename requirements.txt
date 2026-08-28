@@ -2,3 +2,5 @@ supabase
 dropbox
 mnemonic
 aiohttp
+bip_utils
+requests
