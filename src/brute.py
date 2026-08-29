@@ -32,7 +32,7 @@ TRON_API_FILE = "TRON_api.txt"
 ETH_RESPONSE_FILE = "ETH_scan_response.json"
 TRON_RESPONSE_FILE = "TRON_scan_response.json"
 
-MAX_CONCURRENT = 100
+MAX_CONCURRENT = 500
 BATCH_WRITE_INTERVAL = 100
 
 # ------------------ SILENT LOGGING ------------------
@@ -134,30 +134,32 @@ def derive_tron_addresses(seed_phrase):
     except Exception:
         return []
 
-# ------------------ NETWORK / REQUESTS (single call per chain) ------------------
+# ------------------ NETWORK / REQUESTS (with 1–3s delay) ------------------
 async def robust_request(session, url, headers=None):
-    await asyncio.sleep(random.uniform(0.01, 0.03))
+    # Add a random 1-3 second delay to avoid rate limiting
+    await asyncio.sleep(random.uniform(1.0, 3.0))
     while True:
         try:
             async with session.get(url, headers=headers, timeout=30) as r:
                 status = r.status
                 text = await r.text()
                 if status == 429:
-                    await asyncio.sleep(random.uniform(1.0, 2.0))
+                    # Rate limit: wait longer and retry
+                    await asyncio.sleep(random.uniform(2.0, 5.0))
                     continue
                 if status != 200:
-                    await asyncio.sleep(random.uniform(0.2, 0.5))
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
                     continue
                 try:
                     data = json.loads(text)
                 except Exception:
-                    await asyncio.sleep(random.uniform(0.2, 0.5))
+                    await asyncio.sleep(random.uniform(0.5, 1.0))
                     continue
                 return data
         except asyncio.CancelledError:
             raise
         except Exception:
-            await asyncio.sleep(random.uniform(0.2, 0.8))
+            await asyncio.sleep(random.uniform(0.5, 1.5))
 
 async def check_eth_balance(session, address, api_key):
     api_call_counter["eth"] += 1
