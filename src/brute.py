@@ -34,6 +34,8 @@ TRON_RESPONSE_FILE = "TRON_scan_response.json"
 
 MAX_CONCURRENT = 500
 BATCH_WRITE_INTERVAL = 100
+# Minimum number of API keys required (optional, just warn if less)
+MIN_API_KEYS = 1
 
 # ------------------ SILENT LOGGING ------------------
 class NullHandler(logging.Handler):
@@ -72,41 +74,31 @@ def get_dropbox_client():
         print("ERROR: No Dropbox credentials found.")
         sys.exit(1)
 
-# ------------------ API KEY ROTATING MANAGER ------------------
+# ------------------ API KEY ROTATING MANAGER (round-robin) ------------------
 class RotatingBatchManager:
     def __init__(self, keys):
-        self.batch_a = keys[:12]
-        self.batch_b = keys[12:24]
-        self.active_batch = 0
-        self.pointer_a = 0
-        self.pointer_b = 0
+        self.keys = keys
+        self.pointer = 0
         self.lock = asyncio.Lock()
 
-    async def start_rotation(self):
-        while True:
-            await asyncio.sleep(1)
-            async with self.lock:
-                self.active_batch = (self.active_batch + 1) % 2
-
     async def get_n_keys(self, n):
+        """Return a list of n keys in round‑robin order."""
         keys = []
-        for _ in range(n):
-            async with self.lock:
-                if self.active_batch == 0:
-                    key = self.batch_a[self.pointer_a]
-                    self.pointer_a = (self.pointer_a + 1) % len(self.batch_a)
-                else:
-                    key = self.batch_b[self.pointer_b]
-                    self.pointer_b = (self.pointer_b + 1) % len(self.batch_b)
-            keys.append(key)
+        async with self.lock:
+            for _ in range(n):
+                key = self.keys[self.pointer]
+                self.pointer = (self.pointer + 1) % len(self.keys)
+                keys.append(key)
         return keys
 
 def read_api_keys(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
             keys = [line.strip() for line in f if line.strip()]
-        if len(keys) < 24:
-            print(f"ERROR: Not enough API keys in {path}. Minimum required: 24")
+        if len(keys) < MIN_API_KEYS:
+            print(f"WARNING: Only {len(keys)} keys found in {path}. Minimum recommended: {MIN_API_KEYS}")
+        if not keys:
+            print(f"ERROR: No API keys in {path}.")
             return None
         return RotatingBatchManager(keys)
     except Exception as e:
@@ -311,9 +303,6 @@ async def main():
     if not eth_mgr or not tron_mgr:
         print("ERROR: Missing API keys.")
         sys.exit(1)
-
-    asyncio.create_task(eth_mgr.start_rotation())
-    asyncio.create_task(tron_mgr.start_rotation())
 
     dbx = get_dropbox_client()
 
