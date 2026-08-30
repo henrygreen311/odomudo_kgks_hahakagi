@@ -26,7 +26,7 @@ BATCH_SIZE = 100000
 NUM_WORKERS = 20
 PROGRESS_COLUMN = "generation_progress"
 PREVIOUS_SEED_COLUMN = "previous_seed_phrases"
-UPLOAD_BATCH_SIZE = 5
+UPLOAD_BATCH_SIZE = 2
 
 stop_event = None
 
@@ -48,16 +48,32 @@ def get_progress():
     res = supabase.table("brute").select(PROGRESS_COLUMN).limit(1).execute()
     return res.data[0].get(PROGRESS_COLUMN, 0) if res.data else 0
 
-def update_progress(increment):
+def update_progress(increment, total_perms=None):
+    """Atomically increment progress, but never exceed total_perms."""
     supabase = get_supabase()
     row_id = get_row_id()
     try:
-        supabase.rpc("increment_progress", {"inc": increment}).execute()
+        # Use RPC to increment, but cap at total_perms if provided
+        if total_perms is not None:
+            # We need a custom RPC that caps: increment_progress_capped(inc, max_val)
+            # For now, we'll do a read-modify-write with cap (atomic with RPC? Not atomic)
+            # Better: use the existing RPC and then fix after if it overshoots.
+            # Simpler: call the existing RPC, then if progress > total_perms, set it to total_perms.
+            supabase.rpc("increment_progress", {"inc": increment}).execute()
+            # Now check and cap
+            current = supabase.table("brute").select(PROGRESS_COLUMN).eq("id", row_id).execute()
+            if current.data and current.data[0][PROGRESS_COLUMN] > total_perms:
+                supabase.table("brute").update({PROGRESS_COLUMN: total_perms}).eq("id", row_id).execute()
+        else:
+            supabase.rpc("increment_progress", {"inc": increment}).execute()
     except Exception:
+        # Fallback to read-modify-write with cap
         try:
             current = supabase.table("brute").select(PROGRESS_COLUMN).eq("id", row_id).execute()
             if current.data:
                 new_value = current.data[0][PROGRESS_COLUMN] + increment
+                if total_perms is not None and new_value > total_perms:
+                    new_value = total_perms
                 supabase.table("brute").update({PROGRESS_COLUMN: new_value}).eq("id", row_id).execute()
         except Exception as e:
             print(f"Progress update failed: {e}")
@@ -169,9 +185,9 @@ def upload_with_retry(dbx, content, path, max_retries=10):
     return False
 
 # ----------------------------------------------------------------------
-# Worker function – accumulates up to 10 chunks then uploads
+# Worker function – accumulates up to UPLOAD_BATCH_SIZE chunks then uploads
 # ----------------------------------------------------------------------
-def worker(start_idx, count, worker_id, run_id, stop_event, seed_words):
+def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_perms):
     dbx = get_dropbox_client()
     folder_path = DROPBOX_FOLDER_PATH.rstrip('/')
     words = seed_words[:]
@@ -224,7 +240,7 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words):
                 pending.clear()
 
         if (i + 1) % 10000 == 0:
-            update_progress(10000)
+            update_progress(10000, total_perms)
             processed += 10000
 
     if chunk:
@@ -250,7 +266,7 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words):
     total_processed = i + 1 if i > 0 else 0
     remaining_progress = total_processed - processed
     if remaining_progress > 0:
-        update_progress(remaining_progress)
+        update_progress(remaining_progress, total_perms)
 
     print(f"Worker {worker_id} finished. Processed {total_processed} indices. Stopped early: {stop_event.is_set()}")
 
@@ -281,6 +297,12 @@ def main():
     # Get previous seed phrases and progress
     previous_seed_str = get_previous_seed_phrases()
     progress = get_progress()
+
+    # Sanity check: if progress > total_perms, reset it
+    if progress > total_perms:
+        print(f"WARNING: Progress ({progress}) exceeds total permutations ({total_perms}). Resetting to 0.")
+        progress = 0
+        set_progress(0)
 
     # Check if the current seed phrases have been completed before
     if previous_seed_str:
@@ -339,7 +361,7 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
 
     with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
-        futures = [executor.submit(worker, start, count, wid, run_id, stop_event, seed_words)
+        futures = [executor.submit(worker, start, count, wid, run_id, stop_event, seed_words, total_perms)
                    for (start, count, wid) in tasks]
 
         try:
@@ -355,7 +377,7 @@ def main():
 
         final_progress = get_progress()
         if final_progress >= total_perms:
-            # Mark as completed by updating previous_seed_phrases (already set)
+            # Mark as completed (already set previous_seed_phrases)
             print("Generation completed!")
         else:
             print(f"Generation interrupted. Final progress: {final_progress:,} / {total_perms:,}")
