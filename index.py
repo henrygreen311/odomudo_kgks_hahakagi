@@ -44,14 +44,11 @@ def fetch_dropbox_credentials(supabase):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--generate", action="store_true")
-    parser.add_argument("--scan", action="store_true")
+    parser.add_argument("--generate", action="store_true", help="Run only the generator")
+    parser.add_argument("--scan", action="store_true", help="Run the scanner (generator will run first if needed)")
     args = parser.parse_args()
 
-    if not args.generate and not args.scan:
-        print("Please specify --generate or --scan")
-        sys.exit(1)
-
+    # Set environment variables
     config = load_db_config()
     os.environ["SUPABASE_URL"] = config["SUPABASE_URL"]
     os.environ["SUPABASE_KEY"] = config["SUPABASE_KEY"]
@@ -69,19 +66,34 @@ def main():
         os.environ["DROPBOX_REFRESH_TOKEN"] = refresh_token
     os.environ["DROPBOX_FOLDER_PATH"] = folder_path
 
+    # Determine what to run
+    run_generator = False
+    run_scanner = False
+
     if args.generate:
-        # Run generator only
-        subprocess.run(["python3", "-m", "src.generator"], check=True)
+        run_generator = True
     elif args.scan:
-        # First run generator (it will skip if already completed)
-        print("Running generator to prepare seed files...")
+        run_generator = True  # scanner needs generator to prepare files
+        run_scanner = True
+    else:
+        # Default: run both
+        run_generator = True
+        run_scanner = True
+
+    # Run generator if requested
+    if run_generator:
+        print("Running generator...")
         gen_result = subprocess.run(["python3", "-m", "src.generator"])
-        if gen_result.returncode == 0:
-            print("Generator finished. Now starting scanner...")
-            subprocess.run(["python3", "-m", "src.brute"], check=True)
-        else:
-            print("Generator failed. Scanner not started.")
+        if gen_result.returncode != 0:
+            print("Generator failed. Exiting.")
             sys.exit(gen_result.returncode)
+        else:
+            print("Generator completed successfully.")
+
+    # Run scanner if requested (and generator succeeded)
+    if run_scanner:
+        print("Starting Dropbox scanner (src.brute)...")
+        subprocess.run(["python3", "-m", "src.brute"], check=True)
 
 if __name__ == "__main__":
     main()
