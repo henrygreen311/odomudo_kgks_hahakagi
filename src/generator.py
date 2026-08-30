@@ -53,14 +53,9 @@ def update_progress(increment, total_perms=None):
     supabase = get_supabase()
     row_id = get_row_id()
     try:
-        # Use RPC to increment, but cap at total_perms if provided
         if total_perms is not None:
-            # We need a custom RPC that caps: increment_progress_capped(inc, max_val)
-            # For now, we'll do a read-modify-write with cap (atomic with RPC? Not atomic)
-            # Better: use the existing RPC and then fix after if it overshoots.
-            # Simpler: call the existing RPC, then if progress > total_perms, set it to total_perms.
+            # Use existing RPC and then cap if needed
             supabase.rpc("increment_progress", {"inc": increment}).execute()
-            # Now check and cap
             current = supabase.table("brute").select(PROGRESS_COLUMN).eq("id", row_id).execute()
             if current.data and current.data[0][PROGRESS_COLUMN] > total_perms:
                 supabase.table("brute").update({PROGRESS_COLUMN: total_perms}).eq("id", row_id).execute()
@@ -79,7 +74,6 @@ def update_progress(increment, total_perms=None):
             print(f"Progress update failed: {e}")
 
 def set_progress(value):
-    """Set progress to a specific value."""
     supabase = get_supabase()
     row_id = get_row_id()
     try:
@@ -88,14 +82,12 @@ def set_progress(value):
         print(f"Failed to set progress: {e}")
 
 def get_seed_phrases():
-    """Fetch the seed_phrases column from the brute table."""
     supabase = get_supabase()
     res = supabase.table("brute").select("seed_phrases").limit(1).execute()
     if not res.data:
         raise RuntimeError("No row found in 'brute' table.")
     seed_phrases = res.data[0].get("seed_phrases")
     if not seed_phrases:
-        # Fallback: read from local file if column is empty
         try:
             with open("seed_phrases.txt", "r", encoding="utf-8") as f:
                 content = f.read().strip()
@@ -111,7 +103,6 @@ def get_seed_phrases():
     return words
 
 def get_previous_seed_phrases():
-    """Fetch the previous_seed_phrases column."""
     supabase = get_supabase()
     res = supabase.table("brute").select(PREVIOUS_SEED_COLUMN).limit(1).execute()
     if not res.data:
@@ -119,7 +110,6 @@ def get_previous_seed_phrases():
     return res.data[0].get(PREVIOUS_SEED_COLUMN)
 
 def set_previous_seed_phrases(seed_str):
-    """Update previous_seed_phrases column."""
     supabase = get_supabase()
     row_id = get_row_id()
     try:
@@ -128,10 +118,9 @@ def set_previous_seed_phrases(seed_str):
         print(f"Failed to set previous seed phrases: {e}")
 
 # ----------------------------------------------------------------------
-# Dropbox client factory (auto‑refresh via refresh token)
+# Dropbox client
 # ----------------------------------------------------------------------
 def get_dropbox_client():
-    """Return a Dropbox client that auto‑refreshes if refresh credentials exist."""
     if DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET:
         try:
             return dropbox.Dropbox(
@@ -153,7 +142,6 @@ def get_dropbox_client():
 # Upload helper with retry
 # ----------------------------------------------------------------------
 def upload_with_retry(dbx, content, path, max_retries=10):
-    """Upload a file with exponential backoff; returns True on success."""
     retries = 0
     while retries < max_retries:
         try:
@@ -185,7 +173,7 @@ def upload_with_retry(dbx, content, path, max_retries=10):
     return False
 
 # ----------------------------------------------------------------------
-# Worker function – accumulates up to UPLOAD_BATCH_SIZE chunks then uploads
+# Worker – accumulates chunks and uploads, updates progress only after upload
 # ----------------------------------------------------------------------
 def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_perms):
     dbx = get_dropbox_client()
@@ -193,10 +181,9 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
     words = seed_words[:]
     mnemo = Mnemonic("english")
 
-    chunk = []
-    pending = []
+    chunk = []               # current batch of valid seeds
+    pending = []             # list of (content, filename, path)
     file_counter = 0
-    processed = 0
     i = 0
 
     for i in range(count):
@@ -218,6 +205,7 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
         if mnemo.check(mnemonic):
             chunk.append(mnemonic)
 
+        # When we have a full chunk, prepare it for upload
         if len(chunk) >= BATCH_SIZE:
             file_counter += 1
             filename = f"seeds_{run_id}_w{worker_id}_{file_counter:08d}_{len(chunk)}.txt"
@@ -226,23 +214,32 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
             pending.append((content, filename, path))
             chunk = []
 
+            # If we have reached the upload batch size, upload all pending
             if len(pending) >= UPLOAD_BATCH_SIZE:
+                # Upload each file in the batch
+                uploaded_count = 0
                 for content, fname, path in pending:
                     print(f"Worker {worker_id} uploading {fname}...")
                     success = upload_with_retry(dbx, content, path)
                     if success:
                         print(f"Worker {worker_id} uploaded {fname}")
+                        uploaded_count += 1
                     else:
+                        # This should not happen because upload_with_retry retries indefinitely,
+                        # but if it does, we pause and retry until success.
                         print(f"Worker {worker_id} FAILED to upload {fname} – pausing and retrying indefinitely...")
                         while not upload_with_retry(dbx, content, path, max_retries=100):
                             print(f"Worker {worker_id} retrying {fname}...")
                             time.sleep(5)
+                        uploaded_count += 1  # after success
+                # Now update progress for the entire batch
+                if uploaded_count > 0:
+                    increment = uploaded_count * BATCH_SIZE
+                    update_progress(increment, total_perms)
+                    print(f"Worker {worker_id} progress updated by {increment} (uploaded {uploaded_count} files)")
                 pending.clear()
 
-        if (i + 1) % 10000 == 0:
-            update_progress(10000, total_perms)
-            processed += 10000
-
+    # After loop, handle any remaining chunk and pending files
     if chunk:
         file_counter += 1
         filename = f"seeds_{run_id}_w{worker_id}_{file_counter:08d}_{len(chunk)}.txt"
@@ -252,23 +249,25 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
         chunk = []
 
     if pending:
+        uploaded_count = 0
         for content, fname, path in pending:
             print(f"Worker {worker_id} uploading {fname}...")
             success = upload_with_retry(dbx, content, path)
             if success:
                 print(f"Worker {worker_id} uploaded {fname}")
+                uploaded_count += 1
             else:
                 print(f"Worker {worker_id} FAILED to upload {fname} – pausing and retrying indefinitely...")
                 while not upload_with_retry(dbx, content, path, max_retries=100):
                     print(f"Worker {worker_id} retrying {fname}...")
                     time.sleep(5)
+                uploaded_count += 1
+        if uploaded_count > 0:
+            increment = uploaded_count * BATCH_SIZE
+            update_progress(increment, total_perms)
+            print(f"Worker {worker_id} final progress updated by {increment}")
 
-    total_processed = i + 1 if i > 0 else 0
-    remaining_progress = total_processed - processed
-    if remaining_progress > 0:
-        update_progress(remaining_progress, total_perms)
-
-    print(f"Worker {worker_id} finished. Processed {total_processed} indices. Stopped early: {stop_event.is_set()}")
+    print(f"Worker {worker_id} finished. Processed {i+1} indices. Stopped early: {stop_event.is_set()}")
 
 # ----------------------------------------------------------------------
 # Main
@@ -280,10 +279,9 @@ def main():
         print("ERROR: Supabase credentials missing.")
         sys.exit(1)
     if not (DROPBOX_ACCESS_TOKEN or (DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET)):
-        print("ERROR: Missing Dropbox credentials (access token or refresh token + app credentials).")
+        print("ERROR: Missing Dropbox credentials.")
         sys.exit(1)
 
-    # Fetch current seed phrases and previous completed ones
     try:
         seed_words = get_seed_phrases()
         current_seed_str = ' '.join(seed_words)
@@ -294,37 +292,30 @@ def main():
 
     total_perms = math.factorial(len(seed_words))
 
-    # Get previous seed phrases and progress
     previous_seed_str = get_previous_seed_phrases()
     progress = get_progress()
 
-    # Sanity check: if progress > total_perms, reset it
     if progress > total_perms:
         print(f"WARNING: Progress ({progress}) exceeds total permutations ({total_perms}). Resetting to 0.")
         progress = 0
         set_progress(0)
 
-    # Check if the current seed phrases have been completed before
     if previous_seed_str:
         if current_seed_str == previous_seed_str:
-            # Same seed phrases as previous run
             if progress >= total_perms:
                 print("\n" + "="*60)
                 print("This seed phrases has been completed.")
                 print("Update a new seed phrases when brute.py has done scanning all the valid seed phrases.")
                 print("="*60 + "\n")
-                sys.exit(0)  # Exit cleanly, no need to generate
+                sys.exit(0)
             else:
-                # Resume from where we left off
                 print(f"Resuming from progress: {progress:,} / {total_perms:,}")
         else:
-            # New seed phrases – reset progress and update previous
             print(f"New seed phrases detected. Resetting progress.")
             progress = 0
             set_progress(0)
             set_previous_seed_phrases(current_seed_str)
     else:
-        # No previous seed phrases stored – first run
         print("First run detected. Setting previous seed phrases and starting from 0.")
         progress = 0
         set_progress(0)
@@ -377,7 +368,6 @@ def main():
 
         final_progress = get_progress()
         if final_progress >= total_perms:
-            # Mark as completed (already set previous_seed_phrases)
             print("Generation completed!")
         else:
             print(f"Generation interrupted. Final progress: {final_progress:,} / {total_perms:,}")
