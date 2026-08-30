@@ -70,10 +70,18 @@ def main():
     os.environ["DROPBOX_FOLDER_PATH"] = folder_path
 
     if args.generate:
+        # Run generator only
         subprocess.run(["python3", "-m", "src.generator"], check=True)
     elif args.scan:
-        print("Starting Dropbox scanner (src.brute)...")
-        subprocess.run(["python3", "-m", "src.brute"], check=True)
+        # First run generator (it will skip if already completed)
+        print("Running generator to prepare seed files...")
+        gen_result = subprocess.run(["python3", "-m", "src.generator"])
+        if gen_result.returncode == 0:
+            print("Generator finished. Now starting scanner...")
+            subprocess.run(["python3", "-m", "src.brute"], check=True)
+        else:
+            print("Generator failed. Scanner not started.")
+            sys.exit(gen_result.returncode)
 
 if __name__ == "__main__":
     main()
