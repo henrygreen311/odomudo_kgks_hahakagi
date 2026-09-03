@@ -7,27 +7,29 @@ import math
 import signal
 import time
 import random
+import json
+import io
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import dropbox
 from mnemonic import Mnemonic
 from supabase import create_client
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 # ----------------------------------------------------------------------
 # Environment & Constants
 # ----------------------------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
-DROPBOX_FOLDER_PATH = os.getenv("DROPBOX_FOLDER_PATH", "/")
-DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY")
-DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET")
-DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
+DRIVE_CREDENTIALS = os.getenv("DRIVE_CREDENTIALS")
+DRIVE_TOKEN = os.getenv("DRIVE_TOKEN")
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 
 # Process this many permutation indexes per output file
 PERMUTATIONS_PER_FILE = 1_000_000
 
-# Number of workers (processes)
-NUM_WORKERS = 20
+# Number of workers (processes) – increased to 40
+NUM_WORKERS = 40
 
 # Upload files in batches of this size
 UPLOAD_BATCH_SIZE = 5
@@ -126,89 +128,62 @@ def set_previous_seed_phrases(seed_str):
         print(f"Failed to set previous seed phrases: {e}")
 
 # ----------------------------------------------------------------------
-# Dropbox client
+# Google Drive helpers
 # ----------------------------------------------------------------------
-def get_dropbox_client():
-    if DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET:
-        try:
-            return dropbox.Dropbox(
-                oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
-                app_key=DROPBOX_APP_KEY,
-                app_secret=DROPBOX_APP_SECRET,
-            )
-        except Exception as e:
-            print(f"Failed to create Dropbox client with refresh token: {e}")
-            sys.exit(1)
-    elif DROPBOX_ACCESS_TOKEN:
-        print("WARNING: Using short‑lived access token; it may expire.")
-        return dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
-    else:
-        print("ERROR: No Dropbox credentials found.")
-        sys.exit(1)
+def get_drive_service():
+    if not DRIVE_CREDENTIALS or not DRIVE_TOKEN or not DRIVE_FOLDER_ID:
+        raise RuntimeError("Missing Google Drive environment variables")
+    token_info = json.loads(DRIVE_TOKEN)
+    creds = Credentials.from_authorized_user_info(info=token_info, scopes=["https://www.googleapis.com/auth/drive.file"])
+    return build("drive", "v3", credentials=creds)
 
-# ----------------------------------------------------------------------
-# Upload helper with indefinite retry
-# ----------------------------------------------------------------------
-def upload_with_retry(dbx, content, path, max_retries=10):
+def upload_file_with_retry(service, content, filename, folder_id, max_retries=10):
     retries = 0
     while retries < max_retries:
         try:
-            dbx.files_upload(content.encode('utf-8'), path,
-                             mode=dropbox.files.WriteMode.overwrite,
-                             mute=True)
+            file_metadata = {"name": filename, "parents": [folder_id]}
+            media = MediaIoBaseUpload(
+                io.BytesIO(content.encode("utf-8")),
+                mimetype="text/plain",
+                resumable=True
+            )
+            service.files().create(body=file_metadata, media_body=media, fields="id").execute()
             return True
-        except dropbox.exceptions.ApiError as e:
-            if e.error.is_path() and e.error.get_path().is_conflict():
-                print(f"Upload conflict for {path}, skipping.")
-                return True
-            elif e.error.is_rate_limit():
+        except Exception as e:
+            if "rateLimitExceeded" in str(e) or "userRateLimitExceeded" in str(e) or "quotaExceeded" in str(e):
                 wait = 2 ** retries + random.uniform(0, 1)
-                print(f"Rate limit hit for {path}, retrying in {wait:.2f}s...")
+                print(f"Rate limit hit, retrying in {wait:.2f}s...")
                 time.sleep(wait)
                 retries += 1
                 continue
             else:
-                print(f"Upload failed for {path}: {e}")
+                print(f"Upload error: {e}")
                 retries += 1
                 time.sleep(2 ** retries)
                 continue
-        except Exception as e:
-            print(f"Upload error for {path}: {e}")
-            retries += 1
-            time.sleep(2 ** retries)
-            continue
-    print(f"Failed to upload {path} after {max_retries} retries.")
     return False
 
 # ----------------------------------------------------------------------
 # Worker – processes a fixed number of permutations per file
 # ----------------------------------------------------------------------
 def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_perms):
-    """
-    Worker processes count permutation indexes, starting from start_idx.
-    It chunks them into groups of PERMUTATIONS_PER_FILE, collects valid seeds,
-    and uploads the resulting file(s). Progress is only advanced after upload.
-    """
-    dbx = get_dropbox_client()
-    folder_path = DROPBOX_FOLDER_PATH.rstrip('/')
+    service = get_drive_service()
+    folder_id = DRIVE_FOLDER_ID
     words = seed_words[:]
     mnemo = Mnemonic("english")
 
-    # We'll process ranges sequentially
     current = start_idx
     remaining = count
-    pending = []  # (content, filename, path, chunk_size)
+    pending = []  # (content, filename, chunk_size)
 
     while remaining > 0 and not stop_event.is_set():
-        # Determine chunk size for this iteration
         chunk_size = min(remaining, PERMUTATIONS_PER_FILE)
         chunk_start = current
         chunk_end = chunk_start + chunk_size
 
-        # Collect valid seeds in this chunk
+        # --- Process the chunk ---
         valid_seeds = []
         for idx in range(chunk_start, chunk_end):
-            # Compute permutation for idx
             arr = words[:]
             k = idx
             perm = []
@@ -218,71 +193,61 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
                 k %= fact
                 perm.append(arr.pop(pos))
             mnemonic = ' '.join(perm)
-
             if mnemo.check(mnemonic):
                 valid_seeds.append(mnemonic)
 
-        # If there are valid seeds, prepare a file for upload
+        # ---- Prepare or skip ----
         if valid_seeds:
-            file_counter = chunk_start // PERMUTATIONS_PER_FILE + 1  # just a unique counter
+            file_counter = chunk_start // PERMUTATIONS_PER_FILE + 1
             filename = f"seeds_{run_id}_w{worker_id}_{file_counter:08d}_{len(valid_seeds)}.txt"
             content = "\n".join(valid_seeds)
-            path = f"{folder_path}/{filename}"
-            pending.append((content, filename, path, chunk_size))
+            pending.append((content, filename, chunk_size))
+            print(f"[Worker {worker_id}] Chunk [{chunk_start:,} - {chunk_end:,}] → {len(valid_seeds):,} seeds, file ready.")
         else:
-            # No seeds in this chunk – we can mark progress immediately
             update_progress(chunk_size, total_perms)
-            print(f"Worker {worker_id} chunk [{chunk_start:,} - {chunk_end:,}] had no seeds, progress +{chunk_size:,}")
+            print(f"[Worker {worker_id}] Chunk [{chunk_start:,} - {chunk_end:,}] → no seeds, progress +{chunk_size:,}")
 
-        # Move to next chunk
         current += chunk_size
         remaining -= chunk_size
 
-        # If pending has reached the batch size, upload all and update progress
+        # ---- Upload batch if full ----
         if len(pending) >= UPLOAD_BATCH_SIZE:
             total_uploaded = 0
             total_increment = 0
-            for content, fname, path, csize in pending:
-                print(f"Worker {worker_id} uploading {fname}...")
-                success = upload_with_retry(dbx, content, path)
+            print(f"[Worker {worker_id}] Uploading batch of {len(pending)} files...")
+            for content, fname, csize in pending:
+                success = upload_file_with_retry(service, content, fname, folder_id)
                 if success:
-                    print(f"Worker {worker_id} uploaded {fname}")
                     total_uploaded += 1
                     total_increment += csize
                 else:
-                    # Should not happen because upload_with_retry retries indefinitely,
-                    # but if it does, we block until success.
-                    print(f"Worker {worker_id} FAILED to upload {fname} – retrying indefinitely...")
-                    while not upload_with_retry(dbx, content, path, max_retries=100):
+                    # indefinite retry
+                    while not upload_file_with_retry(service, content, fname, folder_id, max_retries=100):
                         time.sleep(5)
                     total_uploaded += 1
                     total_increment += csize
-
-            # Now update global progress for all uploaded files
             if total_increment > 0:
                 update_progress(total_increment, total_perms)
-                print(f"Worker {worker_id} progress +{total_increment:,} ({total_uploaded} files)")
-
+                print(f"[Worker {worker_id}] Batch uploaded – progress +{total_increment:,} ({total_uploaded} files)")
             pending.clear()
 
-    # After loop, handle any remaining pending files
+    # ---- Final flush ----
     if pending and not stop_event.is_set():
         total_increment = 0
-        for content, fname, path, csize in pending:
-            print(f"Worker {worker_id} uploading final {fname}...")
-            success = upload_with_retry(dbx, content, path)
+        print(f"[Worker {worker_id}] Uploading final {len(pending)} files...")
+        for content, fname, csize in pending:
+            success = upload_file_with_retry(service, content, fname, folder_id)
             if success:
-                print(f"Worker {worker_id} uploaded {fname}")
                 total_increment += csize
             else:
-                while not upload_with_retry(dbx, content, path, max_retries=100):
+                while not upload_file_with_retry(service, content, fname, folder_id, max_retries=100):
                     time.sleep(5)
                 total_increment += csize
         if total_increment > 0:
             update_progress(total_increment, total_perms)
-            print(f"Worker {worker_id} final progress +{total_increment:,}")
+            print(f"[Worker {worker_id}] Final batch uploaded – progress +{total_increment:,}")
 
-    print(f"Worker {worker_id} finished. Processed {count} indices. Stopped: {stop_event.is_set()}")
+    print(f"[Worker {worker_id}] Finished. Processed {count:,} indices.")
 
 # ----------------------------------------------------------------------
 # Main entry point
@@ -293,8 +258,8 @@ def main():
     if not all([SUPABASE_URL, SUPABASE_KEY]):
         print("ERROR: Supabase credentials missing.")
         sys.exit(1)
-    if not (DROPBOX_ACCESS_TOKEN or (DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET)):
-        print("ERROR: Missing Dropbox credentials.")
+    if not (DRIVE_CREDENTIALS and DRIVE_TOKEN and DRIVE_FOLDER_ID):
+        print("ERROR: Missing Google Drive environment variables.")
         sys.exit(1)
 
     try:
@@ -306,17 +271,14 @@ def main():
         sys.exit(1)
 
     total_perms = math.factorial(len(seed_words))
-
     previous_seed_str = get_previous_seed_phrases()
     progress = get_progress()
 
-    # Sanity check
     if progress > total_perms:
         print(f"WARNING: Progress ({progress}) exceeds total permutations ({total_perms}). Resetting to 0.")
         progress = 0
         set_progress(0)
 
-    # Detect changed seed phrases
     if previous_seed_str:
         if current_seed_str == previous_seed_str:
             if progress >= total_perms:
@@ -341,11 +303,11 @@ def main():
     remaining = total_perms - progress
     if remaining <= 0:
         print("All permutations already processed.")
-        return
+        sys.exit(0)
 
     print(f"Total permutations: {total_perms:,}, already processed: {progress:,}, remaining: {remaining:,}")
 
-    # Distribute remaining work among workers
+    # Distribute work among workers
     chunk_size = remaining // NUM_WORKERS
     remainder = remaining % NUM_WORKERS
     tasks = []
@@ -359,7 +321,6 @@ def main():
 
     run_id = str(int(time.time()))
 
-    # Setup multiprocessing
     import multiprocessing as mp
     manager = mp.Manager()
     stop_event = manager.Event()
@@ -370,26 +331,38 @@ def main():
 
     signal.signal(signal.SIGINT, signal_handler)
 
-    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
-        futures = [executor.submit(worker, start, count, wid, run_id, stop_event, seed_words, total_perms)
-                   for (start, count, wid) in tasks]
+    try:
+        with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+            futures = [executor.submit(worker, start, count, wid, run_id, stop_event, seed_words, total_perms)
+                       for (start, count, wid) in tasks]
 
-        try:
-            for future in as_completed(futures):
-                future.result()
-        except KeyboardInterrupt:
-            print("Main process interrupted, waiting for workers to finish...")
-            for future in futures:
-                try:
-                    future.result(timeout=10)
-                except Exception:
-                    pass
+            try:
+                for future in as_completed(futures):
+                    future.result()
+            except KeyboardInterrupt:
+                print("Main process interrupted, waiting for workers to finish...")
+                for future in futures:
+                    try:
+                        future.result(timeout=10)
+                    except Exception:
+                        pass
+                final_progress = get_progress()
+                if final_progress < total_perms:
+                    print(f"Generation interrupted. Final progress: {final_progress:,} / {total_perms:,}")
+                    sys.exit(1)
+                else:
+                    sys.exit(0)
+    except Exception as e:
+        print(f"Fatal error in generator: {e}")
+        sys.exit(1)
 
-        final_progress = get_progress()
-        if final_progress >= total_perms:
-            print("Generation completed!")
-        else:
-            print(f"Generation interrupted. Final progress: {final_progress:,} / {total_perms:,}")
+    final_progress = get_progress()
+    if final_progress >= total_perms:
+        print("Generation completed!")
+        sys.exit(0)
+    else:
+        print(f"Generation incomplete. Final progress: {final_progress:,} / {total_perms:,}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

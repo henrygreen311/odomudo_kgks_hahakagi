@@ -9,7 +9,7 @@ import json
 import time
 import random
 import logging
-import dropbox
+import io
 from mnemonic import Mnemonic
 from bip_utils import (
     Bip39SeedGenerator,
@@ -18,23 +18,23 @@ from bip_utils import (
     Bip44Changes,
     Bip44Conf,
 )
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
 Bip44Conf.ENABLE_UNSAFE_HDWALLET = True
 
 # ------------------ CONFIG / CONSTANTS ------------------
-DROPBOX_FOLDER = os.getenv("DROPBOX_FOLDER_PATH", "/")
-DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
-DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY")
-DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET")
-DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+DRIVE_CREDENTIALS = os.getenv("DRIVE_CREDENTIALS")
+DRIVE_TOKEN = os.getenv("DRIVE_TOKEN")
 ETH_API_FILE = "ETH_api.txt"
 TRON_API_FILE = "TRON_api.txt"
 ETH_RESPONSE_FILE = "ETH_scan_response.json"
 TRON_RESPONSE_FILE = "TRON_scan_response.json"
 
-MAX_CONCURRENT = 500
+MAX_CONCURRENT = 600
 BATCH_WRITE_INTERVAL = 100
-# Minimum number of API keys required (optional, just warn if less)
 MIN_API_KEYS = 1
 
 # ------------------ SILENT LOGGING ------------------
@@ -55,24 +55,16 @@ mnemo = Mnemonic("english")
 api_call_counter = {"eth": 0, "tron": 0}
 scanned_counter = 0
 
-# ------------------ DROPBOX CLIENT FACTORY ------------------
-def get_dropbox_client():
-    if DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET:
-        try:
-            return dropbox.Dropbox(
-                oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
-                app_key=DROPBOX_APP_KEY,
-                app_secret=DROPBOX_APP_SECRET,
-            )
-        except Exception as e:
-            print(f"Failed to create Dropbox client with refresh token: {e}")
-            sys.exit(1)
-    elif DROPBOX_ACCESS_TOKEN:
-        print("WARNING: Using short‑lived access token; it may expire.")
-        return dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
-    else:
-        print("ERROR: No Dropbox credentials found.")
-        sys.exit(1)
+# ------------------ GOOGLE DRIVE SERVICE ------------------
+def get_drive_service():
+    """Build and return a Google Drive service object using credentials from environment."""
+    if not DRIVE_CREDENTIALS or not DRIVE_TOKEN or not DRIVE_FOLDER_ID:
+        raise RuntimeError("Missing Google Drive environment variables (DRIVE_CREDENTIALS, DRIVE_TOKEN, DRIVE_FOLDER_ID)")
+
+    token_info = json.loads(DRIVE_TOKEN)
+    creds = Credentials.from_authorized_user_info(info=token_info, scopes=["https://www.googleapis.com/auth/drive.file"])
+    service = build("drive", "v3", credentials=creds)
+    return service
 
 # ------------------ API KEY ROTATING MANAGER (round-robin) ------------------
 class RotatingBatchManager:
@@ -82,7 +74,6 @@ class RotatingBatchManager:
         self.lock = asyncio.Lock()
 
     async def get_n_keys(self, n):
-        """Return a list of n keys in round‑robin order."""
         keys = []
         async with self.lock:
             for _ in range(n):
@@ -128,7 +119,6 @@ def derive_tron_addresses(seed_phrase):
 
 # ------------------ NETWORK / REQUESTS (with 1–3s delay) ------------------
 async def robust_request(session, url, headers=None):
-    # Add a random 1-3 second delay to avoid rate limiting
     await asyncio.sleep(random.uniform(1.0, 3.0))
     while True:
         try:
@@ -136,7 +126,6 @@ async def robust_request(session, url, headers=None):
                 status = r.status
                 text = await r.text()
                 if status == 429:
-                    # Rate limit: wait longer and retry
                     await asyncio.sleep(random.uniform(2.0, 5.0))
                     continue
                 if status != 200:
@@ -206,13 +195,12 @@ class BatchWriter:
                 for entry in to_write:
                     f.write(json.dumps(entry, separators=(",", ":")) + "\n")
 
-# ------------------ SINGLE SEED SCAN (single request per chain) ------------------
+# ------------------ SINGLE SEED SCAN ------------------
 async def scan_seed(seed, eth_key, tron_key, session, writer, eth_sem, tron_sem):
     async with eth_sem, tron_sem:
         eth_addresses = derive_eth_addresses(seed)
         tron_addresses = derive_tron_addresses(seed)
 
-        # ETH – balance only
         eth_responses = []
         for addr in eth_addresses:
             balance, bal_resp = await check_eth_balance(session, addr, eth_key)
@@ -223,7 +211,6 @@ async def scan_seed(seed, eth_key, tron_key, session, writer, eth_sem, tron_sem)
             })
         eth_entry = {"seed": seed, "eth": eth_responses, "timestamp": time.time()}
 
-        # TRON – account info only
         tron_responses = []
         for addr in tron_addresses:
             balance, bal_resp = await check_trx_account(session, addr, tron_key)
@@ -242,14 +229,23 @@ async def scan_seed(seed, eth_key, tron_key, session, writer, eth_sem, tron_sem)
             print(f"Scanned {scanned_counter} seeds so far...")
 
 # ------------------ PROCESS ONE BATCH FILE ------------------
-async def process_batch_file(dbx, file_metadata, eth_mgr, tron_mgr, session,
+async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
                              writer, eth_sem, tron_sem):
-    file_name = file_metadata.name
+    file_id = file_metadata["id"]
+    file_name = file_metadata["name"]
     print(f"Processing file: {file_name}")
 
+    # Download file content
     try:
-        _, res = dbx.files_download(file_metadata.path_display)
-        content = res.content.decode("utf-8")
+        request = service.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+            if status:
+                print(f"Download {int(status.progress() * 100)}% complete.")
+        content = fh.getvalue().decode("utf-8")
         seeds = [line.strip() for line in content.splitlines() if line.strip()]
     except Exception as e:
         print(f"Failed to download {file_name}: {e}")
@@ -257,7 +253,7 @@ async def process_batch_file(dbx, file_metadata, eth_mgr, tron_mgr, session,
 
     if not seeds:
         print(f"File {file_name} is empty, deleting.")
-        dbx.files_delete_v2(file_metadata.path_display)
+        service.files().delete(fileId=file_id).execute()
         return
 
     print(f"File contains {len(seeds)} seeds. Scanning...")
@@ -286,10 +282,10 @@ async def process_batch_file(dbx, file_metadata, eth_mgr, tron_mgr, session,
     except Exception as e:
         print(f"Scanner error: {e}")
 
-    # ---- Now delete the batch file from Dropbox ----
+    # ---- Now delete the file from Google Drive ----
     try:
-        dbx.files_delete_v2(file_metadata.path_display)
-        print(f"Deleted {file_name} from Dropbox.")
+        service.files().delete(fileId=file_id).execute()
+        print(f"Deleted {file_name} from Google Drive.")
     except Exception as e:
         print(f"Failed to delete {file_name}: {e}")
 
@@ -304,7 +300,7 @@ async def main():
         print("ERROR: Missing API keys.")
         sys.exit(1)
 
-    dbx = get_dropbox_client()
+    service = get_drive_service()
 
     eth_sem = asyncio.Semaphore(MAX_CONCURRENT)
     tron_sem = asyncio.Semaphore(MAX_CONCURRENT)
@@ -314,29 +310,28 @@ async def main():
         async with aiohttp.ClientSession() as session:
             while True:
                 try:
-                    entries = dbx.files_list_folder(DROPBOX_FOLDER)
-                    files = [e for e in entries.entries
-                             if isinstance(e, dropbox.files.FileMetadata) and e.name.startswith("seeds_")]
+                    # List files in the Drive folder
+                    results = service.files().list(
+                        q=f"'{DRIVE_FOLDER_ID}' in parents and name contains 'seeds_'",
+                        fields="files(id, name)"
+                    ).execute()
+                    files = results.get("files", [])
 
+                    # --- Exit if no files found ---
                     if not files:
-                        print("No seed files found. Sleeping 30s...")
-                        await asyncio.sleep(30)
-                        continue
+                        print("No seed files found. Exiting.")
+                        break
 
+                    # Sort files by name to process in order
+                    files.sort(key=lambda x: x["name"])
                     for file_meta in files:
                         await process_batch_file(
-                            dbx, file_meta, eth_mgr, tron_mgr, session,
+                            service, file_meta, eth_mgr, tron_mgr, session,
                             writer, eth_sem, tron_sem
                         )
-                except dropbox.exceptions.AuthError as e:
-                    print(f"Authentication error: {e}. The client should auto‑refresh; if this persists, check your refresh token.")
-                    await asyncio.sleep(60)
-                except dropbox.exceptions.ApiError as e:
-                    print(f"Dropbox API error: {e}")
-                    await asyncio.sleep(10)
                 except Exception as e:
-                    print(f"Unexpected error: {e}")
-                    await asyncio.sleep(5)
+                    print(f"Error in main loop: {e}")
+                    await asyncio.sleep(10)
 
     except KeyboardInterrupt:
         print("\nShutdown requested. Cleaning up...")
