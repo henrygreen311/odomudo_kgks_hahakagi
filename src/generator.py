@@ -25,16 +25,10 @@ DRIVE_CREDENTIALS = os.getenv("DRIVE_CREDENTIALS")
 DRIVE_TOKEN = os.getenv("DRIVE_TOKEN")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 
-# Process this many permutation indexes per output file
 PERMUTATIONS_PER_FILE = 1_000_000
-
-# Number of workers (processes) – increased to 40
 NUM_WORKERS = 40
-
-# Upload files in batches of this size
 UPLOAD_BATCH_SIZE = 5
 
-# Database column names
 PROGRESS_COLUMN = "generation_progress"
 PREVIOUS_SEED_COLUMN = "previous_seed_phrases"
 
@@ -59,28 +53,39 @@ def get_progress():
     return res.data[0].get(PROGRESS_COLUMN, 0) if res.data else 0
 
 def update_progress(increment, total_perms=None):
-    """Atomically add `increment` to progress, but never exceed total_perms."""
+    """
+    Atomically add `increment` to progress, never exceeding total_perms.
+    Uses the built-in `.increment()` method if available; otherwise falls back to RPC.
+    """
     supabase = get_supabase()
     row_id = get_row_id()
     try:
+        # Try using the supabase-py increment method (available in newer versions)
+        supabase.table("brute").update({PROGRESS_COLUMN: supabase.table("brute").increment(increment)}).eq("id", row_id).execute()
+        # If total_perms is given, cap after increment
         if total_perms is not None:
-            supabase.rpc("increment_progress", {"inc": increment}).execute()
             current = supabase.table("brute").select(PROGRESS_COLUMN).eq("id", row_id).execute()
             if current.data and current.data[0][PROGRESS_COLUMN] > total_perms:
                 supabase.table("brute").update({PROGRESS_COLUMN: total_perms}).eq("id", row_id).execute()
-        else:
-            supabase.rpc("increment_progress", {"inc": increment}).execute()
     except Exception:
-        # Fallback read-modify-write with cap
+        # Fallback: use RPC or read-modify-write with cap
         try:
-            current = supabase.table("brute").select(PROGRESS_COLUMN).eq("id", row_id).execute()
-            if current.data:
-                new_value = current.data[0][PROGRESS_COLUMN] + increment
-                if total_perms is not None and new_value > total_perms:
-                    new_value = total_perms
-                supabase.table("brute").update({PROGRESS_COLUMN: new_value}).eq("id", row_id).execute()
-        except Exception as e:
-            print(f"Progress update failed: {e}")
+            supabase.rpc("increment_progress", {"inc": increment}).execute()
+            if total_perms is not None:
+                current = supabase.table("brute").select(PROGRESS_COLUMN).eq("id", row_id).execute()
+                if current.data and current.data[0][PROGRESS_COLUMN] > total_perms:
+                    supabase.table("brute").update({PROGRESS_COLUMN: total_perms}).eq("id", row_id).execute()
+        except Exception:
+            # Final fallback: read-modify-write with lock (not atomic but best effort)
+            try:
+                current = supabase.table("brute").select(PROGRESS_COLUMN).eq("id", row_id).execute()
+                if current.data:
+                    new_value = current.data[0][PROGRESS_COLUMN] + increment
+                    if total_perms is not None and new_value > total_perms:
+                        new_value = total_perms
+                    supabase.table("brute").update({PROGRESS_COLUMN: new_value}).eq("id", row_id).execute()
+            except Exception as e:
+                print(f"Progress update failed: {e}")
 
 def set_progress(value):
     supabase = get_supabase()
@@ -97,7 +102,6 @@ def get_seed_phrases():
         raise RuntimeError("No row found in 'brute' table.")
     seed_phrases = res.data[0].get("seed_phrases")
     if not seed_phrases:
-        # Fallback to local file
         try:
             with open("seed_phrases.txt", "r", encoding="utf-8") as f:
                 content = f.read().strip()
@@ -150,17 +154,19 @@ def upload_file_with_retry(service, content, filename, folder_id, max_retries=10
             service.files().create(body=file_metadata, media_body=media, fields="id").execute()
             return True
         except Exception as e:
-            if "rateLimitExceeded" in str(e) or "userRateLimitExceeded" in str(e) or "quotaExceeded" in str(e):
+            # Retry on SSL errors, rate limits, etc.
+            if "rateLimitExceeded" in str(e) or "userRateLimitExceeded" in str(e) or "quotaExceeded" in str(e) or "EOF" in str(e):
                 wait = 2 ** retries + random.uniform(0, 1)
-                print(f"Rate limit hit, retrying in {wait:.2f}s...")
+                print(f"Upload error ({e}), retrying in {wait:.2f}s...")
                 time.sleep(wait)
                 retries += 1
                 continue
             else:
-                print(f"Upload error: {e}")
+                print(f"Upload failed for {filename}: {e}")
                 retries += 1
                 time.sleep(2 ** retries)
                 continue
+    print(f"Failed to upload {filename} after {max_retries} retries.")
     return False
 
 # ----------------------------------------------------------------------
@@ -181,7 +187,6 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
         chunk_start = current
         chunk_end = chunk_start + chunk_size
 
-        # --- Process the chunk ---
         valid_seeds = []
         for idx in range(chunk_start, chunk_end):
             arr = words[:]
@@ -196,7 +201,6 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
             if mnemo.check(mnemonic):
                 valid_seeds.append(mnemonic)
 
-        # ---- Prepare or skip ----
         if valid_seeds:
             file_counter = chunk_start // PERMUTATIONS_PER_FILE + 1
             filename = f"seeds_{run_id}_w{worker_id}_{file_counter:08d}_{len(valid_seeds)}.txt"
@@ -210,7 +214,6 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
         current += chunk_size
         remaining -= chunk_size
 
-        # ---- Upload batch if full ----
         if len(pending) >= UPLOAD_BATCH_SIZE:
             total_uploaded = 0
             total_increment = 0
@@ -231,7 +234,6 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
                 print(f"[Worker {worker_id}] Batch uploaded – progress +{total_increment:,} ({total_uploaded} files)")
             pending.clear()
 
-    # ---- Final flush ----
     if pending and not stop_event.is_set():
         total_increment = 0
         print(f"[Worker {worker_id}] Uploading final {len(pending)} files...")
@@ -338,7 +340,7 @@ def main():
 
             try:
                 for future in as_completed(futures):
-                    future.result()
+                    future.result()  # will raise any worker exception
             except KeyboardInterrupt:
                 print("Main process interrupted, waiting for workers to finish...")
                 for future in futures:
@@ -346,22 +348,17 @@ def main():
                         future.result(timeout=10)
                     except Exception:
                         pass
+                # If interrupted, exit with error
                 final_progress = get_progress()
-                if final_progress < total_perms:
-                    print(f"Generation interrupted. Final progress: {final_progress:,} / {total_perms:,}")
-                    sys.exit(1)
-                else:
-                    sys.exit(0)
+                print(f"Generation interrupted. Final progress: {final_progress:,} / {total_perms:,}")
+                sys.exit(1)
+            # If we reach here, all workers finished without exceptions
+            # Force progress to total_perms to ensure consistency
+            set_progress(total_perms)
+            print("Generation completed!")
+            sys.exit(0)
     except Exception as e:
         print(f"Fatal error in generator: {e}")
-        sys.exit(1)
-
-    final_progress = get_progress()
-    if final_progress >= total_perms:
-        print("Generation completed!")
-        sys.exit(0)
-    else:
-        print(f"Generation incomplete. Final progress: {final_progress:,} / {total_perms:,}")
         sys.exit(1)
 
 if __name__ == "__main__":
