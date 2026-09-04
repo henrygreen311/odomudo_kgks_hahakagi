@@ -324,11 +324,17 @@ async def main():
 
                     # Sort files by name to process in order
                     files.sort(key=lambda x: x["name"])
-                    for file_meta in files:
+                    total_files = len(files)
+                    print(f"Found {total_files} seed files. Processing...")
+
+                    for idx, file_meta in enumerate(files):
                         await process_batch_file(
                             service, file_meta, eth_mgr, tron_mgr, session,
                             writer, eth_sem, tron_sem
                         )
+                        remaining = total_files - (idx + 1)
+                        print(f"Remaining files in Drive: {remaining}")
+
                 except Exception as e:
                     print(f"Error in main loop: {e}")
                     await asyncio.sleep(10)
