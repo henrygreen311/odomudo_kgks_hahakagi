@@ -62,7 +62,6 @@ def update_progress(increment, total_perms=None):
     try:
         # Try using the supabase-py increment method (available in newer versions)
         supabase.table("brute").update({PROGRESS_COLUMN: supabase.table("brute").increment(increment)}).eq("id", row_id).execute()
-        # If total_perms is given, cap after increment
         if total_perms is not None:
             current = supabase.table("brute").select(PROGRESS_COLUMN).eq("id", row_id).execute()
             if current.data and current.data[0][PROGRESS_COLUMN] > total_perms:
@@ -154,8 +153,7 @@ def upload_file_with_retry(service, content, filename, folder_id, max_retries=10
             service.files().create(body=file_metadata, media_body=media, fields="id").execute()
             return True
         except Exception as e:
-            # Retry on SSL errors, rate limits, etc.
-            if "rateLimitExceeded" in str(e) or "userRateLimitExceeded" in str(e) or "quotaExceeded" in str(e) or "EOF" in str(e):
+            if "rateLimitExceeded" in str(e) or "userRateLimitExceeded" in str(e) or "quotaExceeded" in str(e) or "EOF" in str(e) or "502" in str(e) or "timeout" in str(e):
                 wait = 2 ** retries + random.uniform(0, 1)
                 print(f"Upload error ({e}), retrying in {wait:.2f}s...")
                 time.sleep(wait)
@@ -348,15 +346,16 @@ def main():
                         future.result(timeout=10)
                     except Exception:
                         pass
-                # If interrupted, exit with error
                 final_progress = get_progress()
                 print(f"Generation interrupted. Final progress: {final_progress:,} / {total_perms:,}")
                 sys.exit(1)
-            # If we reach here, all workers finished without exceptions
-            # Force progress to total_perms to ensure consistency
+
+            # All workers finished without unhandled exceptions
+            # Force progress to total_perms to guarantee completion marker
             set_progress(total_perms)
             print("Generation completed!")
             sys.exit(0)
+
     except Exception as e:
         print(f"Fatal error in generator: {e}")
         sys.exit(1)
