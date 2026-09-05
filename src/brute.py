@@ -33,7 +33,7 @@ TRON_API_FILE = "TRON_api.txt"
 ETH_RESPONSE_FILE = "ETH_scan_response.json"
 TRON_RESPONSE_FILE = "TRON_scan_response.json"
 
-MAX_CONCURRENT = 600
+MAX_CONCURRENT = 700
 BATCH_WRITE_INTERVAL = 100
 MIN_API_KEYS = 1
 
@@ -282,12 +282,18 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
     except Exception as e:
         print(f"Scanner error: {e}")
 
-    # ---- Now delete the file from Google Drive ----
-    try:
-        service.files().delete(fileId=file_id).execute()
-        print(f"Deleted {file_name} from Google Drive.")
-    except Exception as e:
-        print(f"Failed to delete {file_name}: {e}")
+    # ---- Delete the file from Google Drive with indefinite retry ----
+    retries = 0
+    while True:
+        try:
+            service.files().delete(fileId=file_id).execute()
+            print(f"Deleted {file_name} from Google Drive.")
+            break
+        except Exception as e:
+            retries += 1
+            wait = min(2 ** retries, 60)  # exponential backoff capped at 60s
+            print(f"Delete attempt {retries} failed for {file_name}: {e}. Retrying in {wait}s...")
+            await asyncio.sleep(wait)
 
 # ------------------ MAIN LOOP ------------------
 async def main():
@@ -317,23 +323,22 @@ async def main():
                     ).execute()
                     files = results.get("files", [])
 
-                    # --- Exit if no files found ---
                     if not files:
                         print("No seed files found. Exiting.")
                         break
 
-                    # Sort files by name to process in order
+                    # Sort and process
                     files.sort(key=lambda x: x["name"])
-                    total_files = len(files)
-                    print(f"Found {total_files} seed files. Processing...")
+                    print(f"Found {len(files)} seed files. Processing...")
 
-                    for idx, file_meta in enumerate(files):
+                    for file_meta in files:
                         await process_batch_file(
                             service, file_meta, eth_mgr, tron_mgr, session,
                             writer, eth_sem, tron_sem
                         )
-                        remaining = total_files - (idx + 1)
-                        print(f"Remaining files in Drive: {remaining}")
+
+                    # After processing all files in this list, the loop restarts
+                    # and fetches a fresh list.
 
                 except Exception as e:
                     print(f"Error in main loop: {e}")
