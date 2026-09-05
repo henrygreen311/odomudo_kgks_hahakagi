@@ -33,7 +33,7 @@ TRON_API_FILE = "TRON_api.txt"
 ETH_RESPONSE_FILE = "ETH_scan_response.json"
 TRON_RESPONSE_FILE = "TRON_scan_response.json"
 
-MAX_CONCURRENT = 700
+MAX_CONCURRENT = 500
 BATCH_WRITE_INTERVAL = 100
 MIN_API_KEYS = 1
 
@@ -225,7 +225,7 @@ async def scan_seed(seed, eth_key, tron_key, session, writer, eth_sem, tron_sem)
 
         global scanned_counter
         scanned_counter += 1
-        if scanned_counter % 1000 == 0:
+        if scanned_counter % 5000 == 0:
             print(f"Scanned {scanned_counter} seeds so far...")
 
 # ------------------ PROCESS ONE BATCH FILE ------------------
