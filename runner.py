@@ -8,7 +8,7 @@ import signal
 RUN_INDEX = True
 RUN_SWEEPER = True
 SHOW_INDEX_LOGS = True
-SHOW_SWEEPER_LOGS = True
+SHOW_SWEEPER_LOGS = False
 WAIT_SECONDS = 10
 
 def launch_process(cmd, show_logs, name):
