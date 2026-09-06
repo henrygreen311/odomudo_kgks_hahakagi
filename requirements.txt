@@ -1,12 +1,11 @@
 supabase
 mnemonic
-dropbox
 google-auth
 google-auth-oauthlib
 google-api-python-client
 aiohttp
 bip_utils
 requests
-solana
-web3
-solders
+solana==0.30.0
+web3==6.19.0
+solders==0.19.0
