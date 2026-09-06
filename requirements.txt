@@ -6,6 +6,6 @@ google-api-python-client
 aiohttp
 bip_utils
 requests
-solana==0.30.0
-web3==6.19.0
-solders==0.19.0
+solana==0.36.11
+solders==0.27.1
+web3==7.12.1
