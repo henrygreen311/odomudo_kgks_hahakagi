@@ -23,6 +23,8 @@ async def main():
 
     while True:
         try:
+            print("============================")
+
             eth_balance = await eth.get_balance()
             sol_balance = await sol.get_balance()
 
@@ -57,6 +59,8 @@ async def main():
                 print("Skipped – both below required thresholds.\n")
             else:
                 print("")
+
+            print("============================")
 
             await asyncio.sleep(Config.POLL_INTERVAL)
 
