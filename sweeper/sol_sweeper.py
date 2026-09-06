@@ -9,6 +9,7 @@ from solders.message import Message
 from solders.transaction import Transaction
 from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
 from config import Config
+from telegram import send_log
 
 class SolSweeper:
     def __init__(self):
@@ -39,7 +40,10 @@ class SolSweeper:
 
         fee_estimate = 5000
         if balance_lamports <= fee_estimate:
-            print("  ⚠ SOL balance too low to cover fee.")
+            msg = "SOL balance too low to cover fee."
+            print("  ⚠", msg)
+            if self.cfg.TELEGRAM_ENABLED:
+                await send_log(self.cfg.TELEGRAM_TOKEN, self.cfg.TELEGRAM_CHAT_ID, f"SOL Sweep skipped:\n{msg}")
             return False
 
         amount = balance_lamports - fee_estimate
@@ -60,18 +64,30 @@ class SolSweeper:
         )
 
         tx = Transaction.new_unsigned(msg)
-        # Sign in place (returns None)
         tx.sign([self.source], recent_blockhash)
 
         opts = TxOpts(skip_confirmation=False, max_retries=3)
-        resp = await self.client.send_transaction(tx, opts=opts)
-        txid = resp.value
-        print(f"  ✅ SOL sweep sent: {txid}")
+        try:
+            resp = await self.client.send_transaction(tx, opts=opts)
+            txid = resp.value
+            print(f"  ✅ SOL sweep sent: {txid}")
+            msg = f"SOL sweep sent: {txid}\nAmount: {amount/1e9:.8f} SOL\nTarget: {self.target}"
+            if self.cfg.TELEGRAM_ENABLED:
+                await send_log(self.cfg.TELEGRAM_TOKEN, self.cfg.TELEGRAM_CHAT_ID, msg)
+        except Exception as e:
+            print(f"  ❌ SOL sweep failed: {e}")
+            if self.cfg.TELEGRAM_ENABLED:
+                await send_log(self.cfg.TELEGRAM_TOKEN, self.cfg.TELEGRAM_CHAT_ID, f"SOL sweep failed:\n{str(e)}")
+            return False
 
         conf = await self.client.confirm_transaction(txid, commitment=Confirmed)
         if conf.value.confirmationStatus in ('confirmed', 'finalized'):
             print(f"  ✅ SOL sweep confirmed: {txid}")
+            if self.cfg.TELEGRAM_ENABLED:
+                await send_log(self.cfg.TELEGRAM_TOKEN, self.cfg.TELEGRAM_CHAT_ID, f"SOL sweep confirmed: {txid}")
             return True
         else:
             print(f"  ❌ SOL sweep failed: {txid}")
+            if self.cfg.TELEGRAM_ENABLED:
+                await send_log(self.cfg.TELEGRAM_TOKEN, self.cfg.TELEGRAM_CHAT_ID, f"SOL sweep failed (confirmation timed out): {txid}")
             return False

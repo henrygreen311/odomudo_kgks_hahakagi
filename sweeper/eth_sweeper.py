@@ -4,6 +4,7 @@ from web3 import Web3
 from eth_account import Account
 from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
 from config import Config
+from telegram import send_log
 
 try:
     from web3.middleware import geth_poa_middleware
@@ -16,11 +17,8 @@ except ImportError:
 class EthSweeper:
     def __init__(self):
         self.cfg = Config
-
-        # RPC for sending transactions (Infura – but only used when sweeping)
         self.w3 = Web3(Web3.HTTPProvider(self.cfg.ETH_RPC_URL))
         if not self.w3.is_connected():
-            # Fallback to Cloudflare if Infura fails
             self.w3 = Web3(Web3.HTTPProvider("https://cloudflare-eth.com"))
             if not self.w3.is_connected():
                 raise RuntimeError("Could not connect to any ETH RPC")
@@ -39,7 +37,6 @@ class EthSweeper:
         self.etherscan_key = self.cfg.ETHERSCAN_API_KEY
 
     async def get_balance(self) -> int:
-        """Fetch balance using Etherscan API (free, 100k requests/day)."""
         url = f"https://api.etherscan.io/api?module=account&action=balance&address={self.source.address}&tag=latest&apikey={self.etherscan_key}"
         try:
             async with aiohttp.ClientSession() as session:
@@ -48,10 +45,8 @@ class EthSweeper:
                     if data.get("status") == "1":
                         return int(data.get("result", "0"))
                     else:
-                        # Fallback: use RPC if Etherscan fails
                         return self.w3.eth.get_balance(self.source.address)
         except Exception:
-            # Fallback to RPC
             return self.w3.eth.get_balance(self.source.address)
 
     async def sweep(self) -> bool:
@@ -65,18 +60,28 @@ class EthSweeper:
         try:
             gas_price = self.w3.eth.gas_price
         except Exception as e:
-            print(f"  ⚠ Failed to fetch gas price: {e}")
+            msg = f"ETH gas price fetch failed: {e}"
+            print(f"  ⚠ {msg}")
+            if self.cfg.TELEGRAM_ENABLED:
+                await send_log(self.cfg.TELEGRAM_TOKEN, self.cfg.TELEGRAM_CHAT_ID, f"ETH Sweep failed:\n{msg}")
             return False
 
         gas_price = int(gas_price * self.gas_price_bump)
         gas_cost = gas_price * self.gas_limit
 
         if balance_wei <= gas_cost:
-            print("  ⚠ ETH balance too low to cover gas.")
+            msg = "ETH balance too low to cover gas."
+            print("  ⚠", msg)
+            if self.cfg.TELEGRAM_ENABLED:
+                await send_log(self.cfg.TELEGRAM_TOKEN, self.cfg.TELEGRAM_CHAT_ID, f"ETH Sweep skipped:\n{msg}")
             return False
 
         amount = balance_wei - gas_cost
         if amount <= 0:
+            msg = "ETH amount to send is zero or negative."
+            print("  ⚠", msg)
+            if self.cfg.TELEGRAM_ENABLED:
+                await send_log(self.cfg.TELEGRAM_TOKEN, self.cfg.TELEGRAM_CHAT_ID, f"ETH Sweep skipped:\n{msg}")
             return False
 
         nonce = self.w3.eth.get_transaction_count(self.source.address)
@@ -90,7 +95,6 @@ class EthSweeper:
         }
 
         signed = self.source.sign_transaction(tx)
-
         try:
             raw_tx = signed.raw_transaction
         except AttributeError:
@@ -98,15 +102,25 @@ class EthSweeper:
 
         try:
             tx_hash = self.w3.eth.send_raw_transaction(raw_tx)
-            print(f"  ✅ ETH sweep sent: {tx_hash.hex()}")
+            tx_hex = tx_hash.hex()
+            print(f"  ✅ ETH sweep sent: {tx_hex}")
+            msg = f"ETH sweep sent: {tx_hex}\nAmount: {amount/1e18:.8f} ETH\nTarget: {self.target}"
+            if self.cfg.TELEGRAM_ENABLED:
+                await send_log(self.cfg.TELEGRAM_TOKEN, self.cfg.TELEGRAM_CHAT_ID, msg)
         except Exception as e:
             print(f"  ❌ ETH sweep failed: {e}")
+            if self.cfg.TELEGRAM_ENABLED:
+                await send_log(self.cfg.TELEGRAM_TOKEN, self.cfg.TELEGRAM_CHAT_ID, f"ETH sweep failed:\n{str(e)}")
             return False
 
         receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
         if receipt.status == 1:
-            print(f"  ✅ ETH sweep confirmed: {tx_hash.hex()}")
+            print(f"  ✅ ETH sweep confirmed: {tx_hex}")
+            if self.cfg.TELEGRAM_ENABLED:
+                await send_log(self.cfg.TELEGRAM_TOKEN, self.cfg.TELEGRAM_CHAT_ID, f"ETH sweep confirmed: {tx_hex}")
             return True
         else:
-            print(f"  ❌ ETH sweep failed: {tx_hash.hex()}")
+            print(f"  ❌ ETH sweep failed (receipt status 0): {tx_hex}")
+            if self.cfg.TELEGRAM_ENABLED:
+                await send_log(self.cfg.TELEGRAM_TOKEN, self.cfg.TELEGRAM_CHAT_ID, f"ETH sweep failed (receipt status 0): {tx_hex}")
             return False
