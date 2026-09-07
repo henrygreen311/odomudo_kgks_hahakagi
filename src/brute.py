@@ -21,6 +21,7 @@ from bip_utils import (
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from supabase import create_client
 
 Bip44Conf.ENABLE_UNSAFE_HDWALLET = True
 
@@ -33,9 +34,13 @@ TRON_API_FILE = "TRON_api.txt"
 ETH_RESPONSE_FILE = "ETH_scan_response.json"
 TRON_RESPONSE_FILE = "TRON_scan_response.json"
 
-MAX_CONCURRENT = 800
+MAX_CONCURRENT = 500
 BATCH_WRITE_INTERVAL = 100
 MIN_API_KEYS = 1
+PROGRESS_CHUNK_SIZE = 2000
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # ------------------ SILENT LOGGING ------------------
 class NullHandler(logging.Handler):
@@ -55,18 +60,56 @@ mnemo = Mnemonic("english")
 api_call_counter = {"eth": 0, "tron": 0}
 scanned_counter = 0
 
+# ------------------ SUPABASE HELPERS FOR PROGRESS ------------------
+def get_supabase():
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+def get_row_id():
+    supabase = get_supabase()
+    res = supabase.table("brute").select("id").limit(1).execute()
+    if not res.data:
+        raise RuntimeError("No row in brute table")
+    return res.data[0]["id"]
+
+def get_scan_progress(file_id):
+    supabase = get_supabase()
+    row_id = get_row_id()
+    res = supabase.table("brute").select("scan_progress").eq("id", row_id).execute()
+    if res.data and res.data[0].get("scan_progress"):
+        return res.data[0]["scan_progress"].get(file_id, 0)
+    return 0
+
+def update_scan_progress(file_id, progress):
+    supabase = get_supabase()
+    row_id = get_row_id()
+    res = supabase.table("brute").select("scan_progress").eq("id", row_id).execute()
+    current = res.data[0].get("scan_progress", {}) if res.data else {}
+    if not isinstance(current, dict):
+        current = {}
+    current[file_id] = progress
+    supabase.table("brute").update({"scan_progress": current}).eq("id", row_id).execute()
+
+def delete_scan_progress(file_id):
+    supabase = get_supabase()
+    row_id = get_row_id()
+    res = supabase.table("brute").select("scan_progress").eq("id", row_id).execute()
+    if res.data and res.data[0].get("scan_progress"):
+        current = res.data[0]["scan_progress"]
+        if file_id in current:
+            del current[file_id]
+            supabase.table("brute").update({"scan_progress": current}).eq("id", row_id).execute()
+
 # ------------------ GOOGLE DRIVE SERVICE ------------------
 def get_drive_service():
-    """Build and return a Google Drive service object using credentials from environment."""
     if not DRIVE_CREDENTIALS or not DRIVE_TOKEN or not DRIVE_FOLDER_ID:
-        raise RuntimeError("Missing Google Drive environment variables (DRIVE_CREDENTIALS, DRIVE_TOKEN, DRIVE_FOLDER_ID)")
+        raise RuntimeError("Missing Google Drive environment variables")
 
     token_info = json.loads(DRIVE_TOKEN)
     creds = Credentials.from_authorized_user_info(info=token_info, scopes=["https://www.googleapis.com/auth/drive.file"])
     service = build("drive", "v3", credentials=creds)
     return service
 
-# ------------------ API KEY ROTATING MANAGER (round-robin) ------------------
+# ------------------ API KEY ROTATING MANAGER ------------------
 class RotatingBatchManager:
     def __init__(self, keys):
         self.keys = keys
@@ -87,13 +130,13 @@ def read_api_keys(path):
         with open(path, "r", encoding="utf-8") as f:
             keys = [line.strip() for line in f if line.strip()]
         if len(keys) < MIN_API_KEYS:
-            print(f"WARNING: Only {len(keys)} keys found in {path}. Minimum recommended: {MIN_API_KEYS}")
+            print(f"WARNING: Only {len(keys)} keys found in {path}")
         if not keys:
-            print(f"ERROR: No API keys in {path}.")
+            print(f"ERROR: No API keys in {path}")
             return None
         return RotatingBatchManager(keys)
     except Exception as e:
-        print(f"Error reading {path}: {e}", flush=True)
+        print(f"Error reading {path}: {e}")
         return None
 
 # ------------------ DERIVATION FUNCTIONS ------------------
@@ -117,15 +160,17 @@ def derive_tron_addresses(seed_phrase):
     except Exception:
         return []
 
-# ------------------ NETWORK / REQUESTS (with 1–3s delay) ------------------
+# ------------------ NETWORK / REQUESTS (1s jitter) ------------------
 async def robust_request(session, url, headers=None):
-    await asyncio.sleep(random.uniform(1.0, 3.0))
+    # 1‑second jitter to spread requests evenly (0.5–1.5s)
+    await asyncio.sleep(random.uniform(0.5, 0.8))
     while True:
         try:
             async with session.get(url, headers=headers, timeout=30) as r:
                 status = r.status
                 text = await r.text()
                 if status == 429:
+                    # Rate limit – wait longer and retry
                     await asyncio.sleep(random.uniform(2.0, 5.0))
                     continue
                 if status != 200:
@@ -223,10 +268,27 @@ async def scan_seed(seed, eth_key, tron_key, session, writer, eth_sem, tron_sem)
 
         await writer.add(eth_entry, tron_entry)
 
-        global scanned_counter
-        scanned_counter += 1
-        if scanned_counter % 5000 == 0:
-            print(f"Scanned {scanned_counter} seeds so far...")
+# ------------------ PROCESS A CHUNK OF SEEDS ------------------
+async def process_seed_chunk(seeds, eth_mgr, tron_mgr, session, writer,
+                             eth_sem, tron_sem, start_offset, file_id, total_seeds):
+    tasks = []
+    for seed in seeds:
+        eth_key = await eth_mgr.get_n_keys(1)
+        tron_key = await tron_mgr.get_n_keys(1)
+        task = asyncio.create_task(
+            scan_seed(seed, eth_key[0], tron_key[0], session, writer, eth_sem, tron_sem)
+        )
+        tasks.append(task)
+
+    await asyncio.gather(*tasks)
+    await writer.flush()
+
+    new_progress = start_offset + len(seeds)
+    update_scan_progress(file_id, new_progress)
+
+    global scanned_counter
+    scanned_counter += len(seeds)
+    print(f"Scanned {scanned_counter} seeds so far...")
 
 # ------------------ PROCESS ONE BATCH FILE ------------------
 async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
@@ -235,7 +297,6 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
     file_name = file_metadata["name"]
     print(f"Processing file: {file_name}")
 
-    # Download file content
     try:
         request = service.files().get_media(fileId=file_id)
         fh = io.BytesIO()
@@ -243,8 +304,6 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
         done = False
         while not done:
             status, done = downloader.next_chunk()
-            if status:
-                print(f"Download {int(status.progress() * 100)}% complete.")
         content = fh.getvalue().decode("utf-8")
         seeds = [line.strip() for line in content.splitlines() if line.strip()]
     except Exception as e:
@@ -256,22 +315,32 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
         service.files().delete(fileId=file_id).execute()
         return
 
-    print(f"File contains {len(seeds)} seeds. Scanning...")
+    total_seeds = len(seeds)
+    progress = get_scan_progress(file_id)
 
-    eth_keys = await eth_mgr.get_n_keys(len(seeds))
-    tron_keys = await tron_mgr.get_n_keys(len(seeds))
+    if progress >= total_seeds:
+        print(f"File {file_name} already fully scanned. Deleting.")
+        delete_scan_progress(file_id)
+        service.files().delete(fileId=file_id).execute()
+        return
 
-    tasks = []
-    for i, seed in enumerate(seeds):
-        task = asyncio.create_task(
-            scan_seed(seed, eth_keys[i], tron_keys[i], session, writer, eth_sem, tron_sem)
+    if progress > 0:
+        print(f"Resuming from seed {progress}/{total_seeds}")
+        seeds = seeds[progress:]
+
+    print(f"Scanning {len(seeds)} remaining seeds...")
+
+    for chunk_start in range(0, len(seeds), PROGRESS_CHUNK_SIZE):
+        chunk_end = min(chunk_start + PROGRESS_CHUNK_SIZE, len(seeds))
+        chunk = seeds[chunk_start:chunk_end]
+        await process_seed_chunk(
+            chunk, eth_mgr, tron_mgr, session, writer,
+            eth_sem, tron_sem,
+            progress + chunk_start, file_id, total_seeds
         )
-        tasks.append(task)
 
-    await asyncio.gather(*tasks)
-    await writer.flush()
+    delete_scan_progress(file_id)
 
-    # ---- Call the scanner to detect active wallets ----
     try:
         from src.scanner import process_scanner
         print("Calling scanner to detect active wallets...")
@@ -282,7 +351,6 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
     except Exception as e:
         print(f"Scanner error: {e}")
 
-    # ---- Delete the file from Google Drive with indefinite retry ----
     retries = 0
     while True:
         try:
@@ -291,7 +359,7 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
             break
         except Exception as e:
             retries += 1
-            wait = min(2 ** retries, 60)  # exponential backoff capped at 60s
+            wait = min(2 ** retries, 60)
             print(f"Delete attempt {retries} failed for {file_name}: {e}. Retrying in {wait}s...")
             await asyncio.sleep(wait)
 
@@ -316,7 +384,6 @@ async def main():
         async with aiohttp.ClientSession() as session:
             while True:
                 try:
-                    # List files in the Drive folder
                     results = service.files().list(
                         q=f"'{DRIVE_FOLDER_ID}' in parents and name contains 'seeds_'",
                         fields="files(id, name)"
@@ -327,7 +394,6 @@ async def main():
                         print("No seed files found. Exiting.")
                         break
 
-                    # Sort and process
                     files.sort(key=lambda x: x["name"])
                     print(f"Found {len(files)} seed files. Processing...")
 
@@ -336,9 +402,6 @@ async def main():
                             service, file_meta, eth_mgr, tron_mgr, session,
                             writer, eth_sem, tron_sem
                         )
-
-                    # After processing all files in this list, the loop restarts
-                    # and fetches a fresh list.
 
                 except Exception as e:
                     print(f"Error in main loop: {e}")
