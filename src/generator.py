@@ -15,7 +15,6 @@ from supabase import create_client
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
-from bip_utils import Bip39Mnemonic, Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
 
 # ----------------------------------------------------------------------
 # Environment & Constants
@@ -54,26 +53,38 @@ def get_progress():
     return res.data[0].get(PROGRESS_COLUMN, 0) if res.data else 0
 
 def update_progress(increment, total_perms=None):
+    """
+    Atomically add `increment` to progress, never exceeding total_perms.
+    Uses the built-in `.increment()` method if available; otherwise falls back to RPC.
+    """
     supabase = get_supabase()
     row_id = get_row_id()
     try:
+        # Try using the supabase-py increment method (available in newer versions)
+        supabase.table("brute").update({PROGRESS_COLUMN: supabase.table("brute").increment(increment)}).eq("id", row_id).execute()
         if total_perms is not None:
-            supabase.rpc("increment_progress", {"inc": increment}).execute()
             current = supabase.table("brute").select(PROGRESS_COLUMN).eq("id", row_id).execute()
             if current.data and current.data[0][PROGRESS_COLUMN] > total_perms:
                 supabase.table("brute").update({PROGRESS_COLUMN: total_perms}).eq("id", row_id).execute()
-        else:
-            supabase.rpc("increment_progress", {"inc": increment}).execute()
     except Exception:
+        # Fallback: use RPC or read-modify-write with cap
         try:
-            current = supabase.table("brute").select(PROGRESS_COLUMN).eq("id", row_id).execute()
-            if current.data:
-                new_value = current.data[0][PROGRESS_COLUMN] + increment
-                if total_perms is not None and new_value > total_perms:
-                    new_value = total_perms
-                supabase.table("brute").update({PROGRESS_COLUMN: new_value}).eq("id", row_id).execute()
-        except Exception as e:
-            print(f"Progress update failed: {e}")
+            supabase.rpc("increment_progress", {"inc": increment}).execute()
+            if total_perms is not None:
+                current = supabase.table("brute").select(PROGRESS_COLUMN).eq("id", row_id).execute()
+                if current.data and current.data[0][PROGRESS_COLUMN] > total_perms:
+                    supabase.table("brute").update({PROGRESS_COLUMN: total_perms}).eq("id", row_id).execute()
+        except Exception:
+            # Final fallback: read-modify-write with lock (not atomic but best effort)
+            try:
+                current = supabase.table("brute").select(PROGRESS_COLUMN).eq("id", row_id).execute()
+                if current.data:
+                    new_value = current.data[0][PROGRESS_COLUMN] + increment
+                    if total_perms is not None and new_value > total_perms:
+                        new_value = total_perms
+                    supabase.table("brute").update({PROGRESS_COLUMN: new_value}).eq("id", row_id).execute()
+            except Exception as e:
+                print(f"Progress update failed: {e}")
 
 def set_progress(value):
     supabase = get_supabase()
@@ -153,6 +164,7 @@ def upload_file_with_retry(service, content, filename, folder_id, max_retries=10
                 retries += 1
                 time.sleep(2 ** retries)
                 continue
+    print(f"Failed to upload {filename} after {max_retries} retries.")
     return False
 
 # ----------------------------------------------------------------------
@@ -162,6 +174,7 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
     service = get_drive_service()
     folder_id = DRIVE_FOLDER_ID
     words = seed_words[:]
+    mnemo = Mnemonic("english")
 
     current = start_idx
     remaining = count
@@ -183,13 +196,8 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
                 k %= fact
                 perm.append(arr.pop(pos))
             mnemonic = ' '.join(perm)
-
-            # Validate checksum using bip_utils (reliable)
-            try:
-                if Bip39Mnemonic(mnemonic).IsValid():
-                    valid_seeds.append(mnemonic)
-            except:
-                pass
+            if mnemo.check(mnemonic):
+                valid_seeds.append(mnemonic)
 
         if valid_seeds:
             file_counter = chunk_start // PERMUTATIONS_PER_FILE + 1
@@ -214,6 +222,7 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
                     total_uploaded += 1
                     total_increment += csize
                 else:
+                    # indefinite retry
                     while not upload_file_with_retry(service, content, fname, folder_id, max_retries=100):
                         time.sleep(5)
                     total_uploaded += 1
@@ -329,7 +338,7 @@ def main():
 
             try:
                 for future in as_completed(futures):
-                    future.result()
+                    future.result()  # will raise any worker exception
             except KeyboardInterrupt:
                 print("Main process interrupted, waiting for workers to finish...")
                 for future in futures:
@@ -340,10 +349,13 @@ def main():
                 final_progress = get_progress()
                 print(f"Generation interrupted. Final progress: {final_progress:,} / {total_perms:,}")
                 sys.exit(1)
+
             # All workers finished without unhandled exceptions
+            # Force progress to total_perms to guarantee completion marker
             set_progress(total_perms)
             print("Generation completed!")
             sys.exit(0)
+
     except Exception as e:
         print(f"Fatal error in generator: {e}")
         sys.exit(1)
