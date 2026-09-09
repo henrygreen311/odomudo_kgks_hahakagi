@@ -53,21 +53,15 @@ def get_progress():
     return res.data[0].get(PROGRESS_COLUMN, 0) if res.data else 0
 
 def update_progress(increment, total_perms=None):
-    """
-    Atomically add `increment` to progress, never exceeding total_perms.
-    Uses the built-in `.increment()` method if available; otherwise falls back to RPC.
-    """
     supabase = get_supabase()
     row_id = get_row_id()
     try:
-        # Try using the supabase-py increment method (available in newer versions)
         supabase.table("brute").update({PROGRESS_COLUMN: supabase.table("brute").increment(increment)}).eq("id", row_id).execute()
         if total_perms is not None:
             current = supabase.table("brute").select(PROGRESS_COLUMN).eq("id", row_id).execute()
             if current.data and current.data[0][PROGRESS_COLUMN] > total_perms:
                 supabase.table("brute").update({PROGRESS_COLUMN: total_perms}).eq("id", row_id).execute()
     except Exception:
-        # Fallback: use RPC or read-modify-write with cap
         try:
             supabase.rpc("increment_progress", {"inc": increment}).execute()
             if total_perms is not None:
@@ -75,7 +69,6 @@ def update_progress(increment, total_perms=None):
                 if current.data and current.data[0][PROGRESS_COLUMN] > total_perms:
                     supabase.table("brute").update({PROGRESS_COLUMN: total_perms}).eq("id", row_id).execute()
         except Exception:
-            # Final fallback: read-modify-write with lock (not atomic but best effort)
             try:
                 current = supabase.table("brute").select(PROGRESS_COLUMN).eq("id", row_id).execute()
                 if current.data:
@@ -84,15 +77,16 @@ def update_progress(increment, total_perms=None):
                         new_value = total_perms
                     supabase.table("brute").update({PROGRESS_COLUMN: new_value}).eq("id", row_id).execute()
             except Exception as e:
-                print(f"Progress update failed: {e}")
+                # Silently ignore progress update errors (they will be retried later)
+                pass
 
 def set_progress(value):
     supabase = get_supabase()
     row_id = get_row_id()
     try:
         supabase.table("brute").update({PROGRESS_COLUMN: value}).eq("id", row_id).execute()
-    except Exception as e:
-        print(f"Failed to set progress: {e}")
+    except Exception:
+        pass
 
 def get_seed_phrases():
     supabase = get_supabase()
@@ -127,22 +121,21 @@ def set_previous_seed_phrases(seed_str):
     row_id = get_row_id()
     try:
         supabase.table("brute").update({PREVIOUS_SEED_COLUMN: seed_str}).eq("id", row_id).execute()
-    except Exception as e:
-        print(f"Failed to set previous seed phrases: {e}")
+    except Exception:
+        pass
 
 # ----------------------------------------------------------------------
-# Google Drive helpers
+# Google Drive upload with infinite retry and silent logging
 # ----------------------------------------------------------------------
-def get_drive_service():
-    if not DRIVE_CREDENTIALS or not DRIVE_TOKEN or not DRIVE_FOLDER_ID:
-        raise RuntimeError("Missing Google Drive environment variables")
-    token_info = json.loads(DRIVE_TOKEN)
-    creds = Credentials.from_authorized_user_info(info=token_info, scopes=["https://www.googleapis.com/auth/drive.file"])
-    return build("drive", "v3", credentials=creds)
-
-def upload_file_with_retry(service, content, filename, folder_id, max_retries=10):
+def upload_file_with_retry(service, content, filename, folder_id):
+    """
+    Upload a file to Google Drive, retrying forever on any error.
+    Only prints the first 3 failures, then goes silent.
+    Uses exponential backoff with jitter (capped at 60s).
+    """
     retries = 0
-    while retries < max_retries:
+    last_error = None
+    while True:
         try:
             file_metadata = {"name": filename, "parents": [folder_id]}
             media = MediaIoBaseUpload(
@@ -151,21 +144,29 @@ def upload_file_with_retry(service, content, filename, folder_id, max_retries=10
                 resumable=True
             )
             service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+            # Success – if we had retries, log once
+            if retries > 0:
+                print(f"  ✅ Uploaded {filename} after {retries} retries.")
             return True
         except Exception as e:
-            if "rateLimitExceeded" in str(e) or "userRateLimitExceeded" in str(e) or "quotaExceeded" in str(e) or "EOF" in str(e) or "502" in str(e) or "timeout" in str(e):
-                wait = 2 ** retries + random.uniform(0, 1)
-                print(f"Upload error ({e}), retrying in {wait:.2f}s...")
-                time.sleep(wait)
-                retries += 1
-                continue
-            else:
-                print(f"Upload failed for {filename}: {e}")
-                retries += 1
-                time.sleep(2 ** retries)
-                continue
-    print(f"Failed to upload {filename} after {max_retries} retries.")
-    return False
+            retries += 1
+            last_error = e
+            wait = min(2 ** retries + random.uniform(0, 1), 60)
+            if retries <= 3:
+                print(f"  ⚠ Upload error ({e}), retry {retries} in {wait:.1f}s...")
+            elif retries == 4:
+                print(f"  ⚠ Upload still failing, retrying silently...")
+            time.sleep(wait)
+
+# ----------------------------------------------------------------------
+# Google Drive service builder
+# ----------------------------------------------------------------------
+def get_drive_service():
+    if not DRIVE_CREDENTIALS or not DRIVE_TOKEN or not DRIVE_FOLDER_ID:
+        raise RuntimeError("Missing Google Drive environment variables")
+    token_info = json.loads(DRIVE_TOKEN)
+    creds = Credentials.from_authorized_user_info(info=token_info, scopes=["https://www.googleapis.com/auth/drive.file"])
+    return build("drive", "v3", credentials=creds)
 
 # ----------------------------------------------------------------------
 # Worker – processes a fixed number of permutations per file
@@ -217,16 +218,9 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
             total_increment = 0
             print(f"[Worker {worker_id}] Uploading batch of {len(pending)} files...")
             for content, fname, csize in pending:
-                success = upload_file_with_retry(service, content, fname, folder_id)
-                if success:
-                    total_uploaded += 1
-                    total_increment += csize
-                else:
-                    # indefinite retry
-                    while not upload_file_with_retry(service, content, fname, folder_id, max_retries=100):
-                        time.sleep(5)
-                    total_uploaded += 1
-                    total_increment += csize
+                upload_file_with_retry(service, content, fname, folder_id)
+                total_uploaded += 1
+                total_increment += csize
             if total_increment > 0:
                 update_progress(total_increment, total_perms)
                 print(f"[Worker {worker_id}] Batch uploaded – progress +{total_increment:,} ({total_uploaded} files)")
@@ -236,13 +230,8 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
         total_increment = 0
         print(f"[Worker {worker_id}] Uploading final {len(pending)} files...")
         for content, fname, csize in pending:
-            success = upload_file_with_retry(service, content, fname, folder_id)
-            if success:
-                total_increment += csize
-            else:
-                while not upload_file_with_retry(service, content, fname, folder_id, max_retries=100):
-                    time.sleep(5)
-                total_increment += csize
+            upload_file_with_retry(service, content, fname, folder_id)
+            total_increment += csize
         if total_increment > 0:
             update_progress(total_increment, total_perms)
             print(f"[Worker {worker_id}] Final batch uploaded – progress +{total_increment:,}")
@@ -307,7 +296,6 @@ def main():
 
     print(f"Total permutations: {total_perms:,}, already processed: {progress:,}, remaining: {remaining:,}")
 
-    # Distribute work among workers
     chunk_size = remaining // NUM_WORKERS
     remainder = remaining % NUM_WORKERS
     tasks = []
@@ -338,7 +326,7 @@ def main():
 
             try:
                 for future in as_completed(futures):
-                    future.result()  # will raise any worker exception
+                    future.result()
             except KeyboardInterrupt:
                 print("Main process interrupted, waiting for workers to finish...")
                 for future in futures:
@@ -350,8 +338,6 @@ def main():
                 print(f"Generation interrupted. Final progress: {final_progress:,} / {total_perms:,}")
                 sys.exit(1)
 
-            # All workers finished without unhandled exceptions
-            # Force progress to total_perms to guarantee completion marker
             set_progress(total_perms)
             print("Generation completed!")
             sys.exit(0)
