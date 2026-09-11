@@ -34,10 +34,10 @@ TRON_API_FILE = "TRON_api.txt"
 ETH_RESPONSE_FILE = "ETH_scan_response.json"
 TRON_RESPONSE_FILE = "TRON_scan_response.json"
 
-MAX_CONCURRENT = 500
+MAX_CONCURRENT = 1000          # plenty of headroom for 500 req/sec per chain
 BATCH_WRITE_INTERVAL = 100
 MIN_API_KEYS = 1
-PROGRESS_CHUNK_SIZE = 2000
+PROGRESS_CHUNK_SIZE = 5000     # fewer DB writes
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -60,7 +60,25 @@ mnemo = Mnemonic("english")
 api_call_counter = {"eth": 0, "tron": 0}
 scanned_counter = 0
 
-# ------------------ SUPABASE HELPERS FOR PROGRESS ------------------
+# ------------------ PER-KEY RATE LIMITER ------------------
+class RateLimiter:
+    """Ensures each API key is used at most `rate` times per second."""
+    def __init__(self, keys, rate=5):
+        self.interval = 1.0 / rate
+        self.last_used = {key: 0.0 for key in keys}
+
+    async def wait(self, key):
+        now = time.time()
+        last = self.last_used.get(key, 0.0)
+        if now < last + self.interval:
+            wait_time = last + self.interval - now
+        else:
+            wait_time = 0.0
+        self.last_used[key] = max(now, last + self.interval)
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+
+# ------------------ SUPABASE HELPERS ------------------
 def get_supabase():
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -103,11 +121,9 @@ def delete_scan_progress(file_id):
 def get_drive_service():
     if not DRIVE_CREDENTIALS or not DRIVE_TOKEN or not DRIVE_FOLDER_ID:
         raise RuntimeError("Missing Google Drive environment variables")
-
     token_info = json.loads(DRIVE_TOKEN)
     creds = Credentials.from_authorized_user_info(info=token_info, scopes=["https://www.googleapis.com/auth/drive.file"])
-    service = build("drive", "v3", credentials=creds)
-    return service
+    return build("drive", "v3", credentials=creds)
 
 # ------------------ API KEY ROTATING MANAGER ------------------
 class RotatingBatchManager:
@@ -160,41 +176,41 @@ def derive_tron_addresses(seed_phrase):
     except Exception:
         return []
 
-# ------------------ NETWORK / REQUESTS (1s jitter) ------------------
+# ------------------ NETWORK / REQUESTS ------------------
 async def robust_request(session, url, headers=None):
-    # 1‑second jitter to spread requests evenly (0.5–1.5s)
-    await asyncio.sleep(random.uniform(0.5, 0.8))
     while True:
         try:
             async with session.get(url, headers=headers, timeout=30) as r:
                 status = r.status
                 text = await r.text()
                 if status == 429:
-                    # Rate limit – wait longer and retry
+                    # Should rarely happen with rate limiter, but back off if it does
                     await asyncio.sleep(random.uniform(2.0, 5.0))
                     continue
                 if status != 200:
-                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                    await asyncio.sleep(random.uniform(0.2, 0.5))
                     continue
                 try:
                     data = json.loads(text)
                 except Exception:
-                    await asyncio.sleep(random.uniform(0.5, 1.0))
+                    await asyncio.sleep(random.uniform(0.2, 0.5))
                     continue
                 return data
         except asyncio.CancelledError:
             raise
         except Exception:
-            await asyncio.sleep(random.uniform(0.5, 1.5))
+            await asyncio.sleep(random.uniform(0.2, 0.8))
 
-async def check_eth_balance(session, address, api_key):
+async def check_eth_balance(session, address, api_key, limiter):
+    await limiter.wait(api_key)
     api_call_counter["eth"] += 1
     url = f"https://api.etherscan.io/v2/api?chainid=1&module=account&action=balance&address={address}&tag=latest&apikey={api_key}"
     data = await robust_request(session, url)
     balance = int(data.get("result", 0)) / 1e18 if data.get("status") == "1" else 0.0
     return balance, data
 
-async def check_trx_account(session, address, api_key):
+async def check_trx_account(session, address, api_key, limiter):
+    await limiter.wait(api_key)
     api_call_counter["tron"] += 1
     url = f"https://api.trongrid.io/v1/accounts/{address}"
     headers = {"TRON-PRO-API-KEY": api_key}
@@ -241,14 +257,15 @@ class BatchWriter:
                     f.write(json.dumps(entry, separators=(",", ":")) + "\n")
 
 # ------------------ SINGLE SEED SCAN ------------------
-async def scan_seed(seed, eth_key, tron_key, session, writer, eth_sem, tron_sem):
+async def scan_seed(seed, eth_key, tron_key, session, writer, eth_sem, tron_sem,
+                    eth_limiter, tron_limiter):
     async with eth_sem, tron_sem:
         eth_addresses = derive_eth_addresses(seed)
         tron_addresses = derive_tron_addresses(seed)
 
         eth_responses = []
         for addr in eth_addresses:
-            balance, bal_resp = await check_eth_balance(session, addr, eth_key)
+            balance, bal_resp = await check_eth_balance(session, addr, eth_key, eth_limiter)
             eth_responses.append({
                 "address": addr,
                 "balance": balance,
@@ -258,7 +275,7 @@ async def scan_seed(seed, eth_key, tron_key, session, writer, eth_sem, tron_sem)
 
         tron_responses = []
         for addr in tron_addresses:
-            balance, bal_resp = await check_trx_account(session, addr, tron_key)
+            balance, bal_resp = await check_trx_account(session, addr, tron_key, tron_limiter)
             tron_responses.append({
                 "address": addr,
                 "balance": balance,
@@ -270,13 +287,15 @@ async def scan_seed(seed, eth_key, tron_key, session, writer, eth_sem, tron_sem)
 
 # ------------------ PROCESS A CHUNK OF SEEDS ------------------
 async def process_seed_chunk(seeds, eth_mgr, tron_mgr, session, writer,
-                             eth_sem, tron_sem, start_offset, file_id, total_seeds):
+                             eth_sem, tron_sem, start_offset, file_id, total_seeds,
+                             eth_limiter, tron_limiter):
     tasks = []
     for seed in seeds:
         eth_key = await eth_mgr.get_n_keys(1)
         tron_key = await tron_mgr.get_n_keys(1)
         task = asyncio.create_task(
-            scan_seed(seed, eth_key[0], tron_key[0], session, writer, eth_sem, tron_sem)
+            scan_seed(seed, eth_key[0], tron_key[0], session, writer,
+                      eth_sem, tron_sem, eth_limiter, tron_limiter)
         )
         tasks.append(task)
 
@@ -292,7 +311,7 @@ async def process_seed_chunk(seeds, eth_mgr, tron_mgr, session, writer,
 
 # ------------------ PROCESS ONE BATCH FILE ------------------
 async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
-                             writer, eth_sem, tron_sem):
+                             writer, eth_sem, tron_sem, eth_limiter, tron_limiter):
     file_id = file_metadata["id"]
     file_name = file_metadata["name"]
     print(f"Processing file: {file_name}")
@@ -336,7 +355,8 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
         await process_seed_chunk(
             chunk, eth_mgr, tron_mgr, session, writer,
             eth_sem, tron_sem,
-            progress + chunk_start, file_id, total_seeds
+            progress + chunk_start, file_id, total_seeds,
+            eth_limiter, tron_limiter
         )
 
     delete_scan_progress(file_id)
@@ -374,6 +394,10 @@ async def main():
         print("ERROR: Missing API keys.")
         sys.exit(1)
 
+    # Create per‑key rate limiters (5 req/sec per key)
+    eth_limiter = RateLimiter(eth_mgr.keys, rate=5)
+    tron_limiter = RateLimiter(tron_mgr.keys, rate=5)
+
     service = get_drive_service()
 
     eth_sem = asyncio.Semaphore(MAX_CONCURRENT)
@@ -400,7 +424,7 @@ async def main():
                     for file_meta in files:
                         await process_batch_file(
                             service, file_meta, eth_mgr, tron_mgr, session,
-                            writer, eth_sem, tron_sem
+                            writer, eth_sem, tron_sem, eth_limiter, tron_limiter
                         )
 
                 except Exception as e:
