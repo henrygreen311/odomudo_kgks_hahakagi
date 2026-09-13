@@ -40,6 +40,8 @@ BATCH_WRITE_INTERVAL = 100
 MIN_API_KEYS = 1
 PROGRESS_CHUNK_SIZE = 5000
 
+MAX_DELETE_RETRIES = 10
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
@@ -63,15 +65,17 @@ scanned_counter = 0
 
 # ------------------ PER-KEY RATE LIMITER ------------------
 class RateLimiter:
-    """Ensures each API key is used at most `rate` times per second."""
     def __init__(self, keys, rate=5):
         self.interval = 1.0 / rate
         self.last_used = {key: 0.0 for key in keys}
 
     async def wait(self, key):
-        now = time.monotonic()
+        now = time.time()
         last = self.last_used.get(key, 0.0)
-        wait_time = max(0.0, last + self.interval - now)
+        if now < last + self.interval:
+            wait_time = last + self.interval - now
+        else:
+            wait_time = 0.0
         self.last_used[key] = max(now, last + self.interval)
         if wait_time > 0:
             await asyncio.sleep(wait_time)
@@ -185,17 +189,14 @@ def derive_tron_addresses(seed_phrase):
     except Exception:
         return []
 
-# ------------------ NETWORK (with jitter) ------------------
+# ------------------ NETWORK ------------------
 async def robust_request(session, url, headers=None):
-    # Jitter between 0.5–1.0s before every request to spread load
-    await asyncio.sleep(random.uniform(0.5, 1.0))
     while True:
         try:
             async with session.get(url, headers=headers, timeout=30) as r:
                 status = r.status
                 text = await r.text()
                 if status == 429:
-                    # Back off harder on rate limit
                     await asyncio.sleep(random.uniform(2.0, 5.0))
                     continue
                 if status != 200:
@@ -343,7 +344,10 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
 
     if not seeds:
         print(f"[W{worker_id}] File {file_name} is empty, deleting.")
-        service.files().delete(fileId=file_id).execute()
+        try:
+            service.files().delete(fileId=file_id).execute()
+        except Exception:
+            pass
         return
 
     total_seeds = len(seeds)
@@ -352,7 +356,12 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
     if progress >= total_seeds:
         print(f"[W{worker_id}] File {file_name} already fully scanned. Deleting.")
         delete_scan_progress(file_id, worker_id)
-        service.files().delete(fileId=file_id).execute()
+        try:
+            service.files().delete(fileId=file_id).execute()
+        except Exception as e:
+            # If already gone, that's fine
+            if "404" not in str(e) and "notFound" not in str(e) and "File not found" not in str(e):
+                print(f"[W{worker_id}] Delete failed for already-scanned {file_name}: {e}")
         return
 
     if progress > 0:
@@ -371,8 +380,10 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
             eth_limiter, tron_limiter, worker_id
         )
 
+    # Only delete progress AFTER full scan is complete
     delete_scan_progress(file_id, worker_id)
 
+    # Run the wallet scanner
     try:
         from src.scanner import process_scanner
         print(f"[W{worker_id}] Calling scanner on {eth_response_file} + {tron_response_file}...")
@@ -383,6 +394,8 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
     except Exception as e:
         print(f"[W{worker_id}] Scanner error: {e}")
 
+    # ---- Delete the file from Google Drive ----
+    # 404 = already gone (success). Cap retries on other errors to avoid infinite loops.
     retries = 0
     while True:
         try:
@@ -390,7 +403,20 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
             print(f"[W{worker_id}] Deleted {file_name} from Google Drive.")
             break
         except Exception as e:
+            err_str = str(e)
+
+            # Already gone? Treat as success.
+            if ("404" in err_str
+                    or "File not found" in err_str
+                    or "notFound" in err_str):
+                print(f"[W{worker_id}] File {file_name} already deleted (404) — treating as success.")
+                break
+
             retries += 1
+            if retries > MAX_DELETE_RETRIES:
+                print(f"[W{worker_id}] Giving up on deleting {file_name} after {MAX_DELETE_RETRIES} retries: {e}")
+                break
+
             wait = min(2 ** retries, 60)
             print(f"[W{worker_id}] Delete attempt {retries} failed for {file_name}: {e}. Retrying in {wait}s...")
             await asyncio.sleep(wait)
@@ -418,13 +444,19 @@ async def worker_loop(worker_id, files, eth_keys, tron_keys,
         if stop_event.is_set():
             print(f"[W{worker_id}] Stop signal received, exiting.")
             return
-        await process_batch_file(
-            service, file_meta, eth_mgr, tron_mgr, session,
-            writer, eth_sem, tron_sem, eth_limiter, tron_limiter,
-            worker_id=worker_id,
-            eth_response_file=eth_response_file,
-            tron_response_file=tron_response_file,
-        )
+        try:
+            await process_batch_file(
+                service, file_meta, eth_mgr, tron_mgr, session,
+                writer, eth_sem, tron_sem, eth_limiter, tron_limiter,
+                worker_id=worker_id,
+                eth_response_file=eth_response_file,
+                tron_response_file=tron_response_file,
+            )
+        except asyncio.CancelledError:
+            print(f"[W{worker_id}] Cancelled, exiting.")
+            raise
+        except Exception as e:
+            print(f"[W{worker_id}] Error processing {file_meta.get('name')}: {e}. Skipping to next file.")
 
     print(f"[W{worker_id}] Finished all assigned files.")
 
@@ -455,10 +487,9 @@ async def main():
 
     service = get_drive_service()
 
-    # Safer connector: 200 total, 200 per host
     connector = aiohttp.TCPConnector(
-        limit=200,
-        limit_per_host=200,
+        limit=100,
+        limit_per_host=100,
         ttl_dns_cache=300,
     )
 
@@ -493,12 +524,28 @@ async def main():
                     files_w2 = files[1::2]
                     print(f"Worker 1: {len(files_w1)} files  |  Worker 2: {len(files_w2)} files")
 
-                    await asyncio.gather(
-                        worker_loop(1, files_w1, eth_keys_w1, tron_keys_w1,
-                                    service, session, stop_event),
-                        worker_loop(2, files_w2, eth_keys_w2, tron_keys_w2,
-                                    service, session, stop_event),
-                    )
+                    # Track worker tasks so we can cancel orphans on failure
+                    worker_tasks = [
+                        asyncio.create_task(
+                            worker_loop(1, files_w1, eth_keys_w1, tron_keys_w1,
+                                        service, session, stop_event)
+                        ),
+                        asyncio.create_task(
+                            worker_loop(2, files_w2, eth_keys_w2, tron_keys_w2,
+                                        service, session, stop_event)
+                        ),
+                    ]
+
+                    try:
+                        await asyncio.gather(*worker_tasks)
+                    except Exception as inner_e:
+                        # Cancel any workers still running so they don't become orphans
+                        print(f"Worker failed: {inner_e}. Cancelling remaining workers...")
+                        for t in worker_tasks:
+                            if not t.done():
+                                t.cancel()
+                        await asyncio.gather(*worker_tasks, return_exceptions=True)
+                        raise inner_e
 
                 except Exception as e:
                     print(f"Error in main loop: {e}")
