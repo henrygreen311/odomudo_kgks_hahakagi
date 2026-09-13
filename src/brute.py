@@ -87,33 +87,46 @@ def get_row_id():
         raise RuntimeError("No row in brute table")
     return res.data[0]["id"]
 
-def get_scan_progress(file_id):
+def _progress_column(worker_id):
+    """Return the per-worker progress column name."""
+    return f"scan_progress_w{worker_id}"
+
+def get_scan_progress(file_id, worker_id):
+    """Read progress for a file from the worker's own column."""
     supabase = get_supabase()
     row_id = get_row_id()
-    res = supabase.table("brute").select("scan_progress").eq("id", row_id).execute()
-    if res.data and res.data[0].get("scan_progress"):
-        return res.data[0]["scan_progress"].get(file_id, 0)
+    col = _progress_column(worker_id)
+    res = supabase.table("brute").select(col).eq("id", row_id).execute()
+    if res.data and res.data[0].get(col):
+        return res.data[0][col].get(file_id, 0)
     return 0
 
-def update_scan_progress(file_id, progress):
+def update_scan_progress(file_id, progress, worker_id):
+    """Update progress for a file in the worker's own column (no contention)."""
     supabase = get_supabase()
     row_id = get_row_id()
-    res = supabase.table("brute").select("scan_progress").eq("id", row_id).execute()
-    current = res.data[0].get("scan_progress", {}) if res.data else {}
+    col = _progress_column(worker_id)
+
+    res = supabase.table("brute").select(col).eq("id", row_id).execute()
+    current = res.data[0].get(col, {}) if res.data else {}
     if not isinstance(current, dict):
         current = {}
     current[file_id] = progress
-    supabase.table("brute").update({"scan_progress": current}).eq("id", row_id).execute()
 
-def delete_scan_progress(file_id):
+    supabase.table("brute").update({col: current}).eq("id", row_id).execute()
+
+def delete_scan_progress(file_id, worker_id):
+    """Delete progress entry for a file from the worker's own column."""
     supabase = get_supabase()
     row_id = get_row_id()
-    res = supabase.table("brute").select("scan_progress").eq("id", row_id).execute()
-    if res.data and res.data[0].get("scan_progress"):
-        current = res.data[0]["scan_progress"]
+    col = _progress_column(worker_id)
+
+    res = supabase.table("brute").select(col).eq("id", row_id).execute()
+    if res.data and res.data[0].get(col):
+        current = res.data[0][col]
         if file_id in current:
             del current[file_id]
-            supabase.table("brute").update({"scan_progress": current}).eq("id", row_id).execute()
+            supabase.table("brute").update({col: current}).eq("id", row_id).execute()
 
 # ------------------ GOOGLE DRIVE SERVICE ------------------
 def get_drive_service():
@@ -303,7 +316,7 @@ async def process_seed_chunk(seeds, eth_mgr, tron_mgr, session, writer,
     await writer.flush()
 
     new_progress = start_offset + len(seeds)
-    update_scan_progress(file_id, new_progress)
+    update_scan_progress(file_id, new_progress, worker_id)
 
     global scanned_counter
     scanned_counter += len(seeds)
@@ -336,11 +349,11 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
         return
 
     total_seeds = len(seeds)
-    progress = get_scan_progress(file_id)
+    progress = get_scan_progress(file_id, worker_id)
 
     if progress >= total_seeds:
         print(f"[W{worker_id}] File {file_name} already fully scanned. Deleting.")
-        delete_scan_progress(file_id)
+        delete_scan_progress(file_id, worker_id)
         service.files().delete(fileId=file_id).execute()
         return
 
@@ -360,7 +373,7 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
             eth_limiter, tron_limiter, worker_id
         )
 
-    delete_scan_progress(file_id)
+    delete_scan_progress(file_id, worker_id)
 
     try:
         from src.scanner import process_scanner
