@@ -8,6 +8,7 @@ import aiohttp
 import json
 import time
 import random
+import signal
 import logging
 import io
 from mnemonic import Mnemonic
