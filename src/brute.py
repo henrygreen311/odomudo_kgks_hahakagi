@@ -88,11 +88,9 @@ def get_row_id():
     return res.data[0]["id"]
 
 def _progress_column(worker_id):
-    """Return the per-worker progress column name."""
     return f"scan_progress_w{worker_id}"
 
 def get_scan_progress(file_id, worker_id):
-    """Read progress for a file from the worker's own column."""
     supabase = get_supabase()
     row_id = get_row_id()
     col = _progress_column(worker_id)
@@ -102,7 +100,6 @@ def get_scan_progress(file_id, worker_id):
     return 0
 
 def update_scan_progress(file_id, progress, worker_id):
-    """Update progress for a file in the worker's own column (no contention)."""
     supabase = get_supabase()
     row_id = get_row_id()
     col = _progress_column(worker_id)
@@ -112,11 +109,9 @@ def update_scan_progress(file_id, progress, worker_id):
     if not isinstance(current, dict):
         current = {}
     current[file_id] = progress
-
     supabase.table("brute").update({col: current}).eq("id", row_id).execute()
 
 def delete_scan_progress(file_id, worker_id):
-    """Delete progress entry for a file from the worker's own column."""
     supabase = get_supabase()
     row_id = get_row_id()
     col = _progress_column(worker_id)
@@ -190,14 +185,17 @@ def derive_tron_addresses(seed_phrase):
     except Exception:
         return []
 
-# ------------------ NETWORK ------------------
+# ------------------ NETWORK (with jitter) ------------------
 async def robust_request(session, url, headers=None):
+    # Jitter between 0.5–1.0s before every request to spread load
+    await asyncio.sleep(random.uniform(0.5, 1.0))
     while True:
         try:
             async with session.get(url, headers=headers, timeout=30) as r:
                 status = r.status
                 text = await r.text()
                 if status == 429:
+                    # Back off harder on rate limit
                     await asyncio.sleep(random.uniform(2.0, 5.0))
                     continue
                 if status != 200:
@@ -408,7 +406,6 @@ async def worker_loop(worker_id, files, eth_keys, tron_keys,
     eth_sem = asyncio.Semaphore(MAX_CONCURRENT_PER_WORKER)
     tron_sem = asyncio.Semaphore(MAX_CONCURRENT_PER_WORKER)
 
-    # Per-worker response files (isolated to avoid race conditions)
     eth_response_file = f"ETH_scan_response_w{worker_id}.json"
     tron_response_file = f"TRON_scan_response_w{worker_id}.json"
     writer = BatchWriter(eth_response_file, tron_response_file)
@@ -447,7 +444,6 @@ async def main():
         print(f"WARNING: Only {total_keys} keys available. "
               f"Expected {NUM_WORKERS * KEYS_PER_WORKER}.")
 
-    # Split keys evenly between workers
     half = total_keys // 2
     eth_keys_w1 = eth_keys[:half]
     eth_keys_w2 = eth_keys[half:]
@@ -459,10 +455,10 @@ async def main():
 
     service = get_drive_service()
 
-    # Custom aiohttp connector with high limits (removes default 100-cap)
+    # Safer connector: 200 total, 200 per host
     connector = aiohttp.TCPConnector(
-        limit=2000,
-        limit_per_host=1000,
+        limit=200,
+        limit_per_host=200,
         ttl_dns_cache=300,
     )
 
@@ -493,7 +489,6 @@ async def main():
                     files.sort(key=lambda x: x["name"])
                     print(f"Found {len(files)} seed files. Splitting between 2 workers...")
 
-                    # Worker 1 → odd indices, Worker 2 → even indices
                     files_w1 = files[0::2]
                     files_w2 = files[1::2]
                     print(f"Worker 1: {len(files_w1)} files  |  Worker 2: {len(files_w2)} files")
