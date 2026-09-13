@@ -81,6 +81,12 @@ def main():
         else:
             print("Generator completed successfully.")
 
+        # Run duplicate check after generator, before scanner
+        print("Running duplicate check (src.dup_check)...")
+        dup_result = subprocess.run(["python3", "-m", "src.dup_check"])
+        if dup_result.returncode != 0:
+            print("Duplicate check failed (continuing anyway).")
+
     if run_scanner:
         print("Starting scanner (src.brute)...")
         subprocess.run(["python3", "-m", "src.brute"], check=True)
