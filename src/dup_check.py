@@ -89,7 +89,6 @@ def delete_file(service, file_id, file_name, max_retries=10):
 FILENAME_PATTERN = re.compile(r"^seeds_(\d+)_w(\d+)_(\d+)_(\d+)\.txt$")
 
 def parse_seed_count(filename):
-    """Return the seed count from the filename, or None if it can't be parsed."""
     m = FILENAME_PATTERN.match(filename)
     if m:
         return int(m.group(4))
@@ -111,7 +110,7 @@ def main():
     total_files = len(files)
     print(f"Found {total_files} files in Drive.")
 
-    # ---------- PART 1: check for small files ----------
+    # ---------- PART 1: count small files ----------
     print("\n=== Files with fewer than 50,000 seeds ===")
     small_files = []
     unparsed = []
@@ -123,19 +122,10 @@ def main():
         if count < 50000:
             small_files.append((f["name"], count))
 
-    if small_files:
-        for name, count in sorted(small_files, key=lambda x: x[1]):
-            print(f"  {name}  →  {count:,} seeds")
-        print(f"\nTotal small files: {len(small_files)}")
-    else:
-        print("  None.")
+    print(f"Small files: {len(small_files)}")
 
     if unparsed:
-        print(f"\nWARNING: {len(unparsed)} filenames could not be parsed:")
-        for n in unparsed[:10]:
-            print(f"  {n}")
-        if len(unparsed) > 10:
-            print(f"  ... and {len(unparsed) - 10} more")
+        print(f"Unparsed filenames: {len(unparsed)}")
 
     # ---------- PART 2: duplicate MD5 check ----------
     print("\n=== Duplicate content check (MD5) ===")
@@ -149,7 +139,7 @@ def main():
         by_hash[md5].append(f)
 
     if missing_hash:
-        print(f"WARNING: {missing_hash} files had no MD5 hash; skipping them.")
+        print(f"Files with missing MD5: {missing_hash}")
 
     duplicate_groups = {h: flist for h, flist in by_hash.items() if len(flist) > 1}
 
@@ -158,7 +148,7 @@ def main():
         return
 
     total_duplicates = sum(len(flist) - 1 for flist in duplicate_groups.values())
-    print(f"Found {len(duplicate_groups)} duplicate groups ({total_duplicates} redundant files).")
+    print(f"Duplicate groups: {len(duplicate_groups)}  |  Redundant files: {total_duplicates}")
 
     deleted_count = 0
     for md5, flist in duplicate_groups.items():
@@ -166,9 +156,7 @@ def main():
         keep = flist[0]
         to_delete = flist[1:]
 
-        print(f"\nDuplicate group (MD5: {md5[:12]}...): keeping {keep['name']}")
         for f in to_delete:
-            print(f"  Deleting duplicate: {f['name']}")
             if delete_file(service, f["id"], f["name"]):
                 deleted_count += 1
 
