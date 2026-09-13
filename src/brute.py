@@ -31,13 +31,13 @@ DRIVE_CREDENTIALS = os.getenv("DRIVE_CREDENTIALS")
 DRIVE_TOKEN = os.getenv("DRIVE_TOKEN")
 ETH_API_FILE = "ETH_api.txt"
 TRON_API_FILE = "TRON_api.txt"
-ETH_RESPONSE_FILE = "ETH_scan_response.json"
-TRON_RESPONSE_FILE = "TRON_scan_response.json"
 
-MAX_CONCURRENT = 1000          # plenty of headroom for 500 req/sec per chain
+MAX_CONCURRENT_PER_WORKER = 500
+NUM_WORKERS = 2
+KEYS_PER_WORKER = 50
 BATCH_WRITE_INTERVAL = 100
 MIN_API_KEYS = 1
-PROGRESS_CHUNK_SIZE = 5000     # fewer DB writes
+PROGRESS_CHUNK_SIZE = 5000
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -68,12 +68,9 @@ class RateLimiter:
         self.last_used = {key: 0.0 for key in keys}
 
     async def wait(self, key):
-        now = time.time()
+        now = time.monotonic()
         last = self.last_used.get(key, 0.0)
-        if now < last + self.interval:
-            wait_time = last + self.interval - now
-        else:
-            wait_time = 0.0
+        wait_time = max(0.0, last + self.interval - now)
         self.last_used[key] = max(now, last + self.interval)
         if wait_time > 0:
             await asyncio.sleep(wait_time)
@@ -122,10 +119,13 @@ def get_drive_service():
     if not DRIVE_CREDENTIALS or not DRIVE_TOKEN or not DRIVE_FOLDER_ID:
         raise RuntimeError("Missing Google Drive environment variables")
     token_info = json.loads(DRIVE_TOKEN)
-    creds = Credentials.from_authorized_user_info(info=token_info, scopes=["https://www.googleapis.com/auth/drive.file"])
+    creds = Credentials.from_authorized_user_info(
+        info=token_info,
+        scopes=["https://www.googleapis.com/auth/drive.file"]
+    )
     return build("drive", "v3", credentials=creds)
 
-# ------------------ API KEY ROTATING MANAGER ------------------
+# ------------------ API KEY HELPERS ------------------
 class RotatingBatchManager:
     def __init__(self, keys):
         self.keys = keys
@@ -141,7 +141,7 @@ class RotatingBatchManager:
                 keys.append(key)
         return keys
 
-def read_api_keys(path):
+def read_api_keys_list(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
             keys = [line.strip() for line in f if line.strip()]
@@ -149,13 +149,13 @@ def read_api_keys(path):
             print(f"WARNING: Only {len(keys)} keys found in {path}")
         if not keys:
             print(f"ERROR: No API keys in {path}")
-            return None
-        return RotatingBatchManager(keys)
+            return []
+        return keys
     except Exception as e:
         print(f"Error reading {path}: {e}")
-        return None
+        return []
 
-# ------------------ DERIVATION FUNCTIONS ------------------
+# ------------------ DERIVATION ------------------
 def derive_eth_addresses(seed_phrase):
     try:
         seed_bytes = Bip39SeedGenerator(seed_phrase).Generate()
@@ -176,7 +176,7 @@ def derive_tron_addresses(seed_phrase):
     except Exception:
         return []
 
-# ------------------ NETWORK / REQUESTS ------------------
+# ------------------ NETWORK ------------------
 async def robust_request(session, url, headers=None):
     while True:
         try:
@@ -184,7 +184,6 @@ async def robust_request(session, url, headers=None):
                 status = r.status
                 text = await r.text()
                 if status == 429:
-                    # Should rarely happen with rate limiter, but back off if it does
                     await asyncio.sleep(random.uniform(2.0, 5.0))
                     continue
                 if status != 200:
@@ -285,10 +284,10 @@ async def scan_seed(seed, eth_key, tron_key, session, writer, eth_sem, tron_sem,
 
         await writer.add(eth_entry, tron_entry)
 
-# ------------------ PROCESS A CHUNK OF SEEDS ------------------
+# ------------------ PROCESS A CHUNK ------------------
 async def process_seed_chunk(seeds, eth_mgr, tron_mgr, session, writer,
-                             eth_sem, tron_sem, start_offset, file_id, total_seeds,
-                             eth_limiter, tron_limiter):
+                             eth_sem, tron_sem, start_offset, file_id,
+                             eth_limiter, tron_limiter, worker_id):
     tasks = []
     for seed in seeds:
         eth_key = await eth_mgr.get_n_keys(1)
@@ -307,14 +306,15 @@ async def process_seed_chunk(seeds, eth_mgr, tron_mgr, session, writer,
 
     global scanned_counter
     scanned_counter += len(seeds)
-    print(f"Scanned {scanned_counter} seeds so far...")
+    print(f"[W{worker_id}] Scanned {scanned_counter} seeds so far...")
 
 # ------------------ PROCESS ONE BATCH FILE ------------------
 async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
-                             writer, eth_sem, tron_sem, eth_limiter, tron_limiter):
+                             writer, eth_sem, tron_sem, eth_limiter, tron_limiter,
+                             worker_id, eth_response_file, tron_response_file):
     file_id = file_metadata["id"]
     file_name = file_metadata["name"]
-    print(f"Processing file: {file_name}")
+    print(f"[W{worker_id}] Processing file: {file_name}")
 
     try:
         request = service.files().get_media(fileId=file_id)
@@ -326,11 +326,11 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
         content = fh.getvalue().decode("utf-8")
         seeds = [line.strip() for line in content.splitlines() if line.strip()]
     except Exception as e:
-        print(f"Failed to download {file_name}: {e}")
+        print(f"[W{worker_id}] Failed to download {file_name}: {e}")
         return
 
     if not seeds:
-        print(f"File {file_name} is empty, deleting.")
+        print(f"[W{worker_id}] File {file_name} is empty, deleting.")
         service.files().delete(fileId=file_id).execute()
         return
 
@@ -338,16 +338,16 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
     progress = get_scan_progress(file_id)
 
     if progress >= total_seeds:
-        print(f"File {file_name} already fully scanned. Deleting.")
+        print(f"[W{worker_id}] File {file_name} already fully scanned. Deleting.")
         delete_scan_progress(file_id)
         service.files().delete(fileId=file_id).execute()
         return
 
     if progress > 0:
-        print(f"Resuming from seed {progress}/{total_seeds}")
+        print(f"[W{worker_id}] Resuming from seed {progress}/{total_seeds}")
         seeds = seeds[progress:]
 
-    print(f"Scanning {len(seeds)} remaining seeds...")
+    print(f"[W{worker_id}] Scanning {len(seeds)} remaining seeds...")
 
     for chunk_start in range(0, len(seeds), PROGRESS_CHUNK_SIZE):
         chunk_end = min(chunk_start + PROGRESS_CHUNK_SIZE, len(seeds))
@@ -355,57 +355,115 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
         await process_seed_chunk(
             chunk, eth_mgr, tron_mgr, session, writer,
             eth_sem, tron_sem,
-            progress + chunk_start, file_id, total_seeds,
-            eth_limiter, tron_limiter
+            progress + chunk_start, file_id,
+            eth_limiter, tron_limiter, worker_id
         )
 
     delete_scan_progress(file_id)
 
     try:
         from src.scanner import process_scanner
-        print("Calling scanner to detect active wallets...")
-        process_scanner()
-        print("Scanner finished.")
+        print(f"[W{worker_id}] Calling scanner on {eth_response_file} + {tron_response_file}...")
+        process_scanner(eth_response_file, tron_response_file)
+        print(f"[W{worker_id}] Scanner finished.")
     except ImportError:
-        print("WARNING: src.scanner not found, skipping active wallet detection.")
+        print(f"[W{worker_id}] WARNING: src.scanner not found.")
     except Exception as e:
-        print(f"Scanner error: {e}")
+        print(f"[W{worker_id}] Scanner error: {e}")
 
     retries = 0
     while True:
         try:
             service.files().delete(fileId=file_id).execute()
-            print(f"Deleted {file_name} from Google Drive.")
+            print(f"[W{worker_id}] Deleted {file_name} from Google Drive.")
             break
         except Exception as e:
             retries += 1
             wait = min(2 ** retries, 60)
-            print(f"Delete attempt {retries} failed for {file_name}: {e}. Retrying in {wait}s...")
+            print(f"[W{worker_id}] Delete attempt {retries} failed for {file_name}: {e}. Retrying in {wait}s...")
             await asyncio.sleep(wait)
+
+# ------------------ WORKER LOOP ------------------
+async def worker_loop(worker_id, files, eth_keys, tron_keys,
+                      service, session, stop_event):
+    eth_mgr = RotatingBatchManager(eth_keys)
+    tron_mgr = RotatingBatchManager(tron_keys)
+    eth_limiter = RateLimiter(eth_keys, rate=5)
+    tron_limiter = RateLimiter(tron_keys, rate=5)
+
+    eth_sem = asyncio.Semaphore(MAX_CONCURRENT_PER_WORKER)
+    tron_sem = asyncio.Semaphore(MAX_CONCURRENT_PER_WORKER)
+
+    # Per-worker response files (isolated to avoid race conditions)
+    eth_response_file = f"ETH_scan_response_w{worker_id}.json"
+    tron_response_file = f"TRON_scan_response_w{worker_id}.json"
+    writer = BatchWriter(eth_response_file, tron_response_file)
+
+    print(f"[W{worker_id}] Started: {len(files)} files, "
+          f"{len(eth_keys)} ETH keys, {len(tron_keys)} TRON keys, "
+          f"MAX_CONCURRENT={MAX_CONCURRENT_PER_WORKER}")
+
+    for file_meta in files:
+        if stop_event.is_set():
+            print(f"[W{worker_id}] Stop signal received, exiting.")
+            return
+        await process_batch_file(
+            service, file_meta, eth_mgr, tron_mgr, session,
+            writer, eth_sem, tron_sem, eth_limiter, tron_limiter,
+            worker_id=worker_id,
+            eth_response_file=eth_response_file,
+            tron_response_file=tron_response_file,
+        )
+
+    print(f"[W{worker_id}] Finished all assigned files.")
 
 # ------------------ MAIN LOOP ------------------
 async def main():
     global scanned_counter
     scanned_counter = 0
 
-    eth_mgr = read_api_keys(ETH_API_FILE)
-    tron_mgr = read_api_keys(TRON_API_FILE)
-    if not eth_mgr or not tron_mgr:
+    eth_keys = read_api_keys_list(ETH_API_FILE)
+    tron_keys = read_api_keys_list(TRON_API_FILE)
+    if not eth_keys or not tron_keys:
         print("ERROR: Missing API keys.")
         sys.exit(1)
 
-    # Create per‑key rate limiters (5 req/sec per key)
-    eth_limiter = RateLimiter(eth_mgr.keys, rate=5)
-    tron_limiter = RateLimiter(tron_mgr.keys, rate=5)
+    total_keys = min(len(eth_keys), len(tron_keys))
+    if total_keys < NUM_WORKERS * KEYS_PER_WORKER:
+        print(f"WARNING: Only {total_keys} keys available. "
+              f"Expected {NUM_WORKERS * KEYS_PER_WORKER}.")
+
+    # Split keys evenly between workers
+    half = total_keys // 2
+    eth_keys_w1 = eth_keys[:half]
+    eth_keys_w2 = eth_keys[half:]
+    tron_keys_w1 = tron_keys[:half]
+    tron_keys_w2 = tron_keys[half:]
+
+    print(f"Worker 1: {len(eth_keys_w1)} ETH keys, {len(tron_keys_w1)} TRON keys")
+    print(f"Worker 2: {len(eth_keys_w2)} ETH keys, {len(tron_keys_w2)} TRON keys")
 
     service = get_drive_service()
 
-    eth_sem = asyncio.Semaphore(MAX_CONCURRENT)
-    tron_sem = asyncio.Semaphore(MAX_CONCURRENT)
-    writer = BatchWriter(ETH_RESPONSE_FILE, TRON_RESPONSE_FILE)
+    # Custom aiohttp connector with high limits (removes default 100-cap)
+    connector = aiohttp.TCPConnector(
+        limit=2000,
+        limit_per_host=1000,
+        ttl_dns_cache=300,
+    )
+
+    import multiprocessing as mp
+    manager = mp.Manager()
+    stop_event = manager.Event()
+
+    def signal_handler(sig, frame):
+        print("\nInterrupt received! Setting stop event...")
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, signal_handler)
 
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=connector) as session:
             while True:
                 try:
                     results = service.files().list(
@@ -419,13 +477,19 @@ async def main():
                         break
 
                     files.sort(key=lambda x: x["name"])
-                    print(f"Found {len(files)} seed files. Processing...")
+                    print(f"Found {len(files)} seed files. Splitting between 2 workers...")
 
-                    for file_meta in files:
-                        await process_batch_file(
-                            service, file_meta, eth_mgr, tron_mgr, session,
-                            writer, eth_sem, tron_sem, eth_limiter, tron_limiter
-                        )
+                    # Worker 1 → odd indices, Worker 2 → even indices
+                    files_w1 = files[0::2]
+                    files_w2 = files[1::2]
+                    print(f"Worker 1: {len(files_w1)} files  |  Worker 2: {len(files_w2)} files")
+
+                    await asyncio.gather(
+                        worker_loop(1, files_w1, eth_keys_w1, tron_keys_w1,
+                                    service, session, stop_event),
+                        worker_loop(2, files_w2, eth_keys_w2, tron_keys_w2,
+                                    service, session, stop_event),
+                    )
 
                 except Exception as e:
                     print(f"Error in main loop: {e}")

