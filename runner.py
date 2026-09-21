@@ -6,7 +6,7 @@ import os
 import signal
 
 RUN_INDEX = True
-RUN_SWEEPER = True
+RUN_SWEEPER = False
 SHOW_INDEX_LOGS = True
 SHOW_SWEEPER_LOGS = False
 WAIT_SECONDS = 10
