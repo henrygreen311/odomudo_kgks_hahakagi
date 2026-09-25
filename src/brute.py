@@ -26,10 +26,16 @@ from supabase import create_client
 
 Bip44Conf.ENABLE_UNSAFE_HDWALLET = True
 
+# Add project root to sys.path so we can import test_drive
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+try:
+    from test_drive import refresh_and_update_token
+except Exception as _e:
+    refresh_and_update_token = None
+    print(f"WARNING: Could not import test_drive: {_e}")
+
 # ------------------ CONFIG / CONSTANTS ------------------
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-DRIVE_CREDENTIALS = os.getenv("DRIVE_CREDENTIALS")
-DRIVE_TOKEN = os.getenv("DRIVE_TOKEN")
 ETH_API_FILE = "ETH_api.txt"
 TRON_API_FILE = "TRON_api.txt"
 
@@ -129,9 +135,11 @@ def delete_scan_progress(file_id, worker_id):
 
 # ------------------ GOOGLE DRIVE SERVICE ------------------
 def get_drive_service():
-    if not DRIVE_CREDENTIALS or not DRIVE_TOKEN or not DRIVE_FOLDER_ID:
-        raise RuntimeError("Missing Google Drive environment variables")
-    token_info = json.loads(DRIVE_TOKEN)
+    # Read env vars fresh at call time (they may be set by test_drive.py at runtime)
+    token = os.getenv("DRIVE_TOKEN")
+    if not token:
+        raise RuntimeError("DRIVE_TOKEN is not set (test_drive refresh may have failed)")
+    token_info = json.loads(token)
     creds = Credentials.from_authorized_user_info(
         info=token_info,
         scopes=["https://www.googleapis.com/auth/drive.file"]
@@ -359,7 +367,6 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
         try:
             service.files().delete(fileId=file_id).execute()
         except Exception as e:
-            # If already gone, that's fine
             if "404" not in str(e) and "notFound" not in str(e) and "File not found" not in str(e):
                 print(f"[W{worker_id}] Delete failed for already-scanned {file_name}: {e}")
         return
@@ -380,10 +387,8 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
             eth_limiter, tron_limiter, worker_id
         )
 
-    # Only delete progress AFTER full scan is complete
     delete_scan_progress(file_id, worker_id)
 
-    # Run the wallet scanner
     try:
         from src.scanner import process_scanner
         print(f"[W{worker_id}] Calling scanner on {eth_response_file} + {tron_response_file}...")
@@ -394,8 +399,6 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
     except Exception as e:
         print(f"[W{worker_id}] Scanner error: {e}")
 
-    # ---- Delete the file from Google Drive ----
-    # 404 = already gone (success). Cap retries on other errors to avoid infinite loops.
     retries = 0
     while True:
         try:
@@ -404,8 +407,6 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
             break
         except Exception as e:
             err_str = str(e)
-
-            # Already gone? Treat as success.
             if ("404" in err_str
                     or "File not found" in err_str
                     or "notFound" in err_str):
@@ -465,6 +466,18 @@ async def main():
     global scanned_counter
     scanned_counter = 0
 
+    # Refresh Google Drive token and push it to DB before starting workers
+    if refresh_and_update_token is not None:
+        try:
+            print("Refreshing Google Drive token...")
+            refresh_and_update_token()
+            print("Token refreshed and saved to DB.")
+        except Exception as e:
+            print(f"WARNING: Token refresh failed: {e}")
+            print("Continuing with existing token (may expire).")
+    else:
+        print("WARNING: test_drive module unavailable; skipping token refresh.")
+
     eth_keys = read_api_keys_list(ETH_API_FILE)
     tron_keys = read_api_keys_list(TRON_API_FILE)
     if not eth_keys or not tron_keys:
@@ -507,8 +520,12 @@ async def main():
         async with aiohttp.ClientSession(connector=connector) as session:
             while True:
                 try:
+                    folder_id = os.getenv("DRIVE_FOLDER_ID")
+                    if not folder_id:
+                        raise RuntimeError("DRIVE_FOLDER_ID env var is missing")
+
                     results = service.files().list(
-                        q=f"'{DRIVE_FOLDER_ID}' in parents and name contains 'seeds_'",
+                        q=f"'{folder_id}' in parents and name contains 'seeds_'",
                         fields="files(id, name)"
                     ).execute()
                     files = results.get("files", [])
@@ -524,7 +541,6 @@ async def main():
                     files_w2 = files[1::2]
                     print(f"Worker 1: {len(files_w1)} files  |  Worker 2: {len(files_w2)} files")
 
-                    # Track worker tasks so we can cancel orphans on failure
                     worker_tasks = [
                         asyncio.create_task(
                             worker_loop(1, files_w1, eth_keys_w1, tron_keys_w1,
@@ -539,7 +555,6 @@ async def main():
                     try:
                         await asyncio.gather(*worker_tasks)
                     except Exception as inner_e:
-                        # Cancel any workers still running so they don't become orphans
                         print(f"Worker failed: {inner_e}. Cancelling remaining workers...")
                         for t in worker_tasks:
                             if not t.done():
