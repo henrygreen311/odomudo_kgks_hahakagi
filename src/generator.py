@@ -154,6 +154,7 @@ def set_scanned(value):
     row_id = get_row_id()
     try:
         supabase.table("brute").update({SCANNED_COLUMN: value}).eq("id", row_id).execute()
+        print(f"[generator] scanned = {value}")
     except Exception as e:
         print(f"WARNING: failed to set scanned={value}: {e}")
 
@@ -195,16 +196,6 @@ def get_drive_service():
 
 # ----------------------------------------------------------------------
 # Worker – FAST permutation generator (ported from main.py)
-#
-# Key optimisations vs. the previous version:
-#   1. Precomputed factorials stored in local variables.
-#   2. Direct unrank into p0..p11 with successive `a.pop(i)` (no
-#      per-iteration call to math.factorial, no inner for-loop).
-#   3. Checksum validation done via bit arithmetic + a single
-#      sha256() on the raw 128-bit entropy (no mnemonic string built
-#      and no mnemo.check() call for the 99.99% of permutations that
-#      fail the checksum).
-#   4. Word string is only built for valid permutations.
 # ----------------------------------------------------------------------
 def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_perms):
     service = get_drive_service()
@@ -219,7 +210,6 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
     wordlist = WORDLIST
     sha256 = hashlib.sha256
 
-    # Precomputed factorials for the 12! unranking
     f11, f10, f9, f8, f7, f6 = 39916800, 3628800, 362880, 40320, 5040, 720
     f5, f4, f3, f2 = 120, 24, 6, 2
 
@@ -314,22 +304,27 @@ def main():
         sys.exit(1)
 
     # ------------------------------------------------------------------
-    # NEW: if 'scanned' == 'f', generate a brand-new seed phrase here
-    # (same approach as main.py: MNEMO.generate(strength=128)) and store
-    # it in the seed_phrases column. The rest of the flow then picks
-    # the new seed up automatically.
+    # State machine gate:
+    #   'f'  -> a batch has been produced and is awaiting scanning. Skip.
+    #   't'  -> brute.py finished scanning the previous batch. Run/reset.
+    #   anything else / None -> skip (safe default).
     # ------------------------------------------------------------------
     scanned = get_scanned()
     print(f"scanned = {scanned!r}")
 
-    if scanned == "f":
-        new_seed = MNEMO.generate(strength=128)
-        print(f"scanned='f' → generating new seed phrase: {new_seed}")
-        try:
-            set_seed_phrases(new_seed)
-        except Exception as e:
-            print(f"ERROR: failed to store new seed phrase: {e}")
-            sys.exit(1)
+    if scanned != "t":
+        print(f"scanned={scanned!r} → nothing to do (need 't' to generate a new batch). Skipping.")
+        sys.exit(0)
+
+    # scanned == "t" → mint a brand-new seed phrase (same as main.py) and
+    # let the "new seed detected" logic below reset progress automatically.
+    new_seed = MNEMO.generate(strength=128)
+    print(f"scanned='t' → generating new seed phrase: {new_seed}")
+    try:
+        set_seed_phrases(new_seed)
+    except Exception as e:
+        print(f"ERROR: failed to store new seed phrase: {e}")
+        sys.exit(1)
 
     try:
         seed_words = get_seed_phrases()
@@ -355,6 +350,9 @@ def main():
                 print("This seed phrases has been completed.")
                 print("Update a new seed phrases when brute.py has done scanning all the valid seed phrases.")
                 print("="*60 + "\n")
+                # Ensure the flag is 'f' so the next generator run also skips
+                # until brute.py flips it to 't'.
+                set_scanned("f")
                 sys.exit(0)
             else:
                 print(f"Resuming from progress: {progress:,} / {total_perms:,}")
@@ -372,6 +370,7 @@ def main():
     remaining = total_perms - progress
     if remaining <= 0:
         print("All permutations already processed.")
+        set_scanned("f")
         sys.exit(0)
 
     print(f"Total permutations: {total_perms:,}, already processed: {progress:,}, remaining: {remaining:,}")
@@ -416,9 +415,12 @@ def main():
                         pass
                 final_progress = get_progress()
                 print(f"Generation interrupted. Final progress: {final_progress:,} / {total_perms:,}")
+                # Do NOT flip scanned here; leave it as 't' so a re-run resumes.
                 sys.exit(1)
 
             set_progress(total_perms)
+            # Batch is now fully uploaded → mark as awaiting scan.
+            set_scanned("f")
             print("Generation completed!")
             sys.exit(0)
 
