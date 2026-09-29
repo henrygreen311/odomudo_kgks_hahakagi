@@ -9,6 +9,7 @@ import time
 import random
 import json
 import io
+import hashlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from mnemonic import Mnemonic
 from supabase import create_client
@@ -31,6 +32,16 @@ UPLOAD_BATCH_SIZE = 5
 
 PROGRESS_COLUMN = "generation_progress"
 PREVIOUS_SEED_COLUMN = "previous_seed_phrases"
+SEED_PHRASES_COLUMN = "seed_phrases"
+SCANNED_COLUMN = "scanned"
+
+# ----------------------------------------------------------------------
+# BIP39 fast-path tables (same approach as main.py)
+# ----------------------------------------------------------------------
+MNEMO = Mnemonic("english")
+WORDLIST = MNEMO.wordlist
+WORD_TO_IDX = {w: i for i, w in enumerate(WORDLIST)}
+FACTORIALS = [math.factorial(i) for i in range(13)]
 
 stop_event = None
 
@@ -76,8 +87,7 @@ def update_progress(increment, total_perms=None):
                     if total_perms is not None and new_value > total_perms:
                         new_value = total_perms
                     supabase.table("brute").update({PROGRESS_COLUMN: new_value}).eq("id", row_id).execute()
-            except Exception as e:
-                # Silently ignore progress update errors (they will be retried later)
+            except Exception:
                 pass
 
 def set_progress(value):
@@ -90,10 +100,10 @@ def set_progress(value):
 
 def get_seed_phrases():
     supabase = get_supabase()
-    res = supabase.table("brute").select("seed_phrases").limit(1).execute()
+    res = supabase.table("brute").select(SEED_PHRASES_COLUMN).limit(1).execute()
     if not res.data:
         raise RuntimeError("No row found in 'brute' table.")
-    seed_phrases = res.data[0].get("seed_phrases")
+    seed_phrases = res.data[0].get(SEED_PHRASES_COLUMN)
     if not seed_phrases:
         try:
             with open("seed_phrases.txt", "r", encoding="utf-8") as f:
@@ -108,6 +118,12 @@ def get_seed_phrases():
     if len(words) != 12:
         raise ValueError(f"seed_phrases must contain exactly 12 words, got {len(words)}")
     return words
+
+def set_seed_phrases(seed_str):
+    """Store a 12-word seed phrase in the seed_phrases column."""
+    supabase = get_supabase()
+    row_id = get_row_id()
+    supabase.table("brute").update({SEED_PHRASES_COLUMN: seed_str}).eq("id", row_id).execute()
 
 def get_previous_seed_phrases():
     supabase = get_supabase()
@@ -124,17 +140,28 @@ def set_previous_seed_phrases(seed_str):
     except Exception:
         pass
 
+def get_scanned():
+    """Return the current value of the 'scanned' column ('t'/'f') or None."""
+    supabase = get_supabase()
+    res = supabase.table("brute").select(SCANNED_COLUMN).limit(1).execute()
+    if not res.data:
+        return None
+    return res.data[0].get(SCANNED_COLUMN)
+
+def set_scanned(value):
+    """Set the 'scanned' column ('t'/'f')."""
+    supabase = get_supabase()
+    row_id = get_row_id()
+    try:
+        supabase.table("brute").update({SCANNED_COLUMN: value}).eq("id", row_id).execute()
+    except Exception as e:
+        print(f"WARNING: failed to set scanned={value}: {e}")
+
 # ----------------------------------------------------------------------
-# Google Drive upload with infinite retry and silent logging
+# Google Drive upload with infinite retry
 # ----------------------------------------------------------------------
 def upload_file_with_retry(service, content, filename, folder_id):
-    """
-    Upload a file to Google Drive, retrying forever on any error.
-    Only prints the first 3 failures, then goes silent.
-    Uses exponential backoff with jitter (capped at 60s).
-    """
     retries = 0
-    last_error = None
     while True:
         try:
             file_metadata = {"name": filename, "parents": [folder_id]}
@@ -144,13 +171,11 @@ def upload_file_with_retry(service, content, filename, folder_id):
                 resumable=True
             )
             service.files().create(body=file_metadata, media_body=media, fields="id").execute()
-            # Success – if we had retries, log once
             if retries > 0:
                 print(f"  ✅ Uploaded {filename} after {retries} retries.")
             return True
         except Exception as e:
             retries += 1
-            last_error = e
             wait = min(2 ** retries + random.uniform(0, 1), 60)
             if retries <= 3:
                 print(f"  ⚠ Upload error ({e}), retry {retries} in {wait:.1f}s...")
@@ -158,24 +183,45 @@ def upload_file_with_retry(service, content, filename, folder_id):
                 print(f"  ⚠ Upload still failing, retrying silently...")
             time.sleep(wait)
 
-# ----------------------------------------------------------------------
-# Google Drive service builder
-# ----------------------------------------------------------------------
 def get_drive_service():
     if not DRIVE_CREDENTIALS or not DRIVE_TOKEN or not DRIVE_FOLDER_ID:
         raise RuntimeError("Missing Google Drive environment variables")
     token_info = json.loads(DRIVE_TOKEN)
-    creds = Credentials.from_authorized_user_info(info=token_info, scopes=["https://www.googleapis.com/auth/drive.file"])
+    creds = Credentials.from_authorized_user_info(
+        info=token_info,
+        scopes=["https://www.googleapis.com/auth/drive.file"]
+    )
     return build("drive", "v3", credentials=creds)
 
 # ----------------------------------------------------------------------
-# Worker – processes a fixed number of permutations per file
+# Worker – FAST permutation generator (ported from main.py)
+#
+# Key optimisations vs. the previous version:
+#   1. Precomputed factorials stored in local variables.
+#   2. Direct unrank into p0..p11 with successive `a.pop(i)` (no
+#      per-iteration call to math.factorial, no inner for-loop).
+#   3. Checksum validation done via bit arithmetic + a single
+#      sha256() on the raw 128-bit entropy (no mnemonic string built
+#      and no mnemo.check() call for the 99.99% of permutations that
+#      fail the checksum).
+#   4. Word string is only built for valid permutations.
 # ----------------------------------------------------------------------
 def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_perms):
     service = get_drive_service()
     folder_id = DRIVE_FOLDER_ID
-    words = seed_words[:]
-    mnemo = Mnemonic("english")
+
+    try:
+        base_indices = [WORD_TO_IDX[w] for w in seed_words]
+    except KeyError as e:
+        raise ValueError(f"Unknown word in seed phrase: {e}")
+
+    b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11 = base_indices
+    wordlist = WORDLIST
+    sha256 = hashlib.sha256
+
+    # Precomputed factorials for the 12! unranking
+    f11, f10, f9, f8, f7, f6 = 39916800, 3628800, 362880, 40320, 5040, 720
+    f5, f4, f3, f2 = 120, 24, 6, 2
 
     current = start_idx
     remaining = count
@@ -188,17 +234,33 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
 
         valid_seeds = []
         for idx in range(chunk_start, chunk_end):
-            arr = words[:]
+            a = [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11]
             k = idx
-            perm = []
-            for j in range(12, 0, -1):
-                fact = math.factorial(j - 1)
-                pos = k // fact
-                k %= fact
-                perm.append(arr.pop(pos))
-            mnemonic = ' '.join(perm)
-            if mnemo.check(mnemonic):
-                valid_seeds.append(mnemonic)
+
+            i = k // f11; k -= i * f11; p0 = a.pop(i)
+            i = k // f10; k -= i * f10; p1 = a.pop(i)
+            i = k // f9;  k -= i * f9;  p2 = a.pop(i)
+            i = k // f8;  k -= i * f8;  p3 = a.pop(i)
+            i = k // f7;  k -= i * f7;  p4 = a.pop(i)
+            i = k // f6;  k -= i * f6;  p5 = a.pop(i)
+            i = k // f5;  k -= i * f5;  p6 = a.pop(i)
+            i = k // f4;  k -= i * f4;  p7 = a.pop(i)
+            i = k // f3;  k -= i * f3;  p8 = a.pop(i)
+            i = k // f2;  k -= i * f2;  p9 = a.pop(i)
+            p10 = a.pop(k)
+            p11 = a[0]
+
+            bits = (p0 << 121) | (p1 << 110) | (p2 << 99)  | (p3 << 88) | \
+                   (p4 << 77)  | (p5 << 66)  | (p6 << 55)  | (p7 << 44) | \
+                   (p8 << 33)  | (p9 << 22)  | (p10 << 11) | p11
+
+            # BIP39 checksum: last 4 bits == first 4 bits of sha256(entropy)
+            if (bits & 0xF) == (sha256((bits >> 4).to_bytes(16, "big")).digest()[0] >> 4):
+                valid_seeds.append(
+                    f"{wordlist[p0]} {wordlist[p1]} {wordlist[p2]} {wordlist[p3]} "
+                    f"{wordlist[p4]} {wordlist[p5]} {wordlist[p6]} {wordlist[p7]} "
+                    f"{wordlist[p8]} {wordlist[p9]} {wordlist[p10]} {wordlist[p11]}"
+                )
 
         if valid_seeds:
             file_counter = chunk_start // PERMUTATIONS_PER_FILE + 1
@@ -250,6 +312,24 @@ def main():
     if not (DRIVE_CREDENTIALS and DRIVE_TOKEN and DRIVE_FOLDER_ID):
         print("ERROR: Missing Google Drive environment variables.")
         sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # NEW: if 'scanned' == 'f', generate a brand-new seed phrase here
+    # (same approach as main.py: MNEMO.generate(strength=128)) and store
+    # it in the seed_phrases column. The rest of the flow then picks
+    # the new seed up automatically.
+    # ------------------------------------------------------------------
+    scanned = get_scanned()
+    print(f"scanned = {scanned!r}")
+
+    if scanned == "f":
+        new_seed = MNEMO.generate(strength=128)
+        print(f"scanned='f' → generating new seed phrase: {new_seed}")
+        try:
+            set_seed_phrases(new_seed)
+        except Exception as e:
+            print(f"ERROR: failed to store new seed phrase: {e}")
+            sys.exit(1)
 
     try:
         seed_words = get_seed_phrases()

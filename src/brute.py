@@ -51,6 +51,8 @@ MAX_DELETE_RETRIES = 10
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+SCANNED_COLUMN = "scanned"
+
 # ------------------ SILENT LOGGING ------------------
 class NullHandler(logging.Handler):
     def emit(self, record):
@@ -96,6 +98,16 @@ def get_row_id():
     if not res.data:
         raise RuntimeError("No row in brute table")
     return res.data[0]["id"]
+
+def set_scanned(value):
+    """Set the 'scanned' column on the brute row (expects 't' or 'f')."""
+    supabase = get_supabase()
+    row_id = get_row_id()
+    try:
+        supabase.table("brute").update({SCANNED_COLUMN: value}).eq("id", row_id).execute()
+        print(f"[brute] scanned = {value}")
+    except Exception as e:
+        print(f"[brute] WARNING: failed to set scanned={value}: {e}")
 
 def _progress_column(worker_id):
     return f"scan_progress_w{worker_id}"
@@ -532,6 +544,8 @@ async def main():
 
                     if not files:
                         print("No seed files found. Exiting.")
+                        # All Drive batch files have been processed → mark as scanned
+                        set_scanned("t")
                         break
 
                     files.sort(key=lambda x: x["name"])
